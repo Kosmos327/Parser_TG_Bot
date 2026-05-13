@@ -10,7 +10,7 @@ from telethon import TelegramClient, events
 
 from app.bot_handlers import register_bot_handlers
 from app.config import Settings, load_settings
-from app.filters import message_matches
+from app.filters import should_process_message
 from app.leads_storage import append_lead
 from app.models import LeadEvent
 from app.notifier import send_lead_notification
@@ -18,11 +18,28 @@ from app.state import ParserState
 from app.storage import load_processed, save_processed
 from app.utils import build_message_link
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
 logger = logging.getLogger(__name__)
+
+
+def _configure_logging(log_level: str) -> None:
+    logging.basicConfig(
+        level=getattr(logging, log_level),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        force=True,
+    )
+
+
+def _truncate_text(text: str, max_length: int) -> str:
+    if len(text) <= max_length:
+        return text
+
+    if max_length == 1:
+        return "…"
+    return f"{text[: max_length - 1]}…"
+
+
+def _is_forwarded(message: Any) -> bool:
+    return bool(getattr(message, "fwd_from", None) or getattr(message, "forward", None))
 
 
 def _processed_key(source_id: int | None, message_id: int) -> str:
@@ -65,6 +82,7 @@ async def _cancel_task(task: asyncio.Task[Any]) -> None:
 
 async def run() -> None:
     settings = load_settings()
+    _configure_logging(settings.log_level)
     state = ParserState(enabled=settings.parser_enabled)
     processed = load_processed(settings.dedup_file)
     logger.info("Loaded %s processed message keys.", len(processed))
@@ -72,49 +90,69 @@ async def run() -> None:
     client = TelegramClient(settings.session_name, settings.api_id, settings.api_hash)
     bot = Bot(token=settings.bot_token)
     dispatcher = Dispatcher()
-    register_bot_handlers(dispatcher, settings, state)
+    register_bot_handlers(dispatcher, settings, state, telethon_client=client)
 
     @client.on(_build_event_builder(settings))
     async def handle_new_message(event: events.NewMessage.Event) -> None:
         state.processed_count += 1
         try:
-            if not state.enabled:
-                logger.debug("Parser is paused. Skipping message %s.", getattr(event.message, "id", None))
-                return
-
-            text = (event.message.message or "").strip()
-            if not message_matches(text, settings.keywords):
-                return
-
             source_id = event.chat_id
             message_id = event.message.id
+            chat = await event.get_chat()
+            sender = await event.get_sender()
+            source_title = _source_title(chat, source_id)
+
+            if not state.enabled:
+                logger.debug("Parser is paused. Skipping message %s.", message_id)
+                return
+
+            if settings.ignore_bots and getattr(sender, "bot", False):
+                logger.debug("Skipping message %s: bot sender.", message_id)
+                return
+
+            if settings.ignore_forwards and _is_forwarded(event.message):
+                logger.debug("Skipping message %s: forwarded message.", message_id)
+                return
+
+            text = event.message.message or ""
+            should_process, skip_reason = should_process_message(text, source_title, settings)
+            if not should_process:
+                logger.debug("Skipping message %s: %s.", message_id, skip_reason)
+                return
+
             key = _processed_key(source_id, message_id)
             if key in processed:
                 logger.debug("Message %s has already been processed.", key)
                 return
 
-            chat = await event.get_chat()
-            sender = await event.get_sender()
-
             lead = LeadEvent(
-                source_title=_source_title(chat, source_id),
+                source_title=source_title,
                 source_id=source_id,
                 message_id=message_id,
                 sender_id=getattr(sender, "id", None),
                 sender_username=getattr(sender, "username", None),
                 sender_first_name=getattr(sender, "first_name", None),
-                text=text,
+                text=_truncate_text(text.strip(), settings.max_text_length),
                 message_link=build_message_link(chat, source_id, message_id),
                 matched_at=datetime.now(timezone.utc),
             )
 
             append_lead(settings.leads_file, lead)
-            await send_lead_notification(bot, settings.admin_chat_id, lead)
+            if settings.dry_run:
+                logger.info("Lead found in dry-run mode. Notification skipped for message %s.", key)
+            else:
+                await send_lead_notification(
+                    bot,
+                    settings.admin_chat_id,
+                    lead,
+                    max_text_length=settings.max_text_length,
+                )
 
             state.matched_count += 1
             processed.add(key)
             save_processed(settings.dedup_file, processed)
-            logger.info("Lead saved, notification sent, and message %s marked as processed.", key)
+            notification_status = ", notification sent" if not settings.dry_run else ""
+            logger.info("Lead saved%s and message %s marked as processed.", notification_status, key)
         except Exception as exc:
             state.last_error = str(exc)
             logger.exception("Failed to process incoming message.")

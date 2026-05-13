@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+from functools import wraps
 from html import escape
+from typing import Any
 
 from aiogram import Dispatcher, Router
 from aiogram.filters import Command
@@ -33,6 +36,8 @@ def _format_help() -> str:
         "/stats — статистика сохранённых заявок\n"
         "/keywords — текущие ключевые фразы\n"
         "/sources — текущие источники\n"
+        "/config — безопасная конфигурация\n"
+        "/health — состояние polling, Telethon и парсера\n"
         "/help — список команд"
     )
 
@@ -76,6 +81,7 @@ def _format_lead(lead: LeadEvent, index: int) -> str:
 
 def _admin_only(settings: Settings):
     def decorator(handler):
+        @wraps(handler)
         async def wrapper(message: Message) -> None:
             if not is_admin(message, settings):
                 await message.answer("Нет доступа.")
@@ -87,7 +93,83 @@ def _admin_only(settings: Settings):
     return decorator
 
 
-def register_bot_handlers(dispatcher: Dispatcher, settings: Settings, state: ParserState) -> None:
+def _format_bool(value: bool) -> str:
+    return "on" if value else "off"
+
+
+def _format_list(title: str, values: list[str]) -> str:
+    if not values:
+        return f"{title} (0): нет"
+
+    formatted = "\n".join(f"  - {escape(value)}" for value in values)
+    return f"{title} ({len(values)}):\n{formatted}"
+
+
+def _format_uptime(started_at: datetime) -> str:
+    total_seconds = max(0, int((datetime.now(timezone.utc) - started_at).total_seconds()))
+    days, remainder = divmod(total_seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if days:
+        return f"{days}d {hours}h {minutes}m {seconds}s"
+    if hours:
+        return f"{hours}h {minutes}m {seconds}s"
+    if minutes:
+        return f"{minutes}m {seconds}s"
+    return f"{seconds}s"
+
+
+def _format_safe_config(settings: Settings, state: ParserState) -> str:
+    parts = [
+        "<b>Безопасная конфигурация</b>",
+        f"parser_enabled: {_format_bool(state.enabled)}",
+        f"dry_run: {_format_bool(settings.dry_run)}",
+        f"min_message_length: {settings.min_message_length}",
+        f"ignore_bots: {_format_bool(settings.ignore_bots)}",
+        f"ignore_forwards: {_format_bool(settings.ignore_forwards)}",
+        f"session_name: {escape(settings.session_name)}",
+        _format_list("keywords", settings.keywords),
+        _format_list("exclude_keywords", settings.exclude_keywords),
+        _format_list("source_chats", settings.source_chats),
+        _format_list("include_source_titles", settings.include_source_titles),
+        _format_list("exclude_source_titles", settings.exclude_source_titles),
+        f"leads_file: {escape(settings.leads_file)}",
+        f"dedup_file: {escape(settings.dedup_file)}",
+        f"log_level: {escape(settings.log_level)}",
+    ]
+    return "\n".join(parts)
+
+
+def _telethon_status(client: Any | None) -> str:
+    if client is None:
+        return "unknown"
+
+    try:
+        return "connected" if client.is_connected() else "disconnected"
+    except Exception:
+        return "unknown"
+
+
+def _format_health(settings: Settings, state: ParserState, client: Any | None) -> str:
+    return (
+        "<b>Health</b>\n"
+        "Bot polling: OK\n"
+        f"Telethon client: {_telethon_status(client)}\n"
+        f"Parser: {'enabled' if state.enabled else 'disabled'}\n"
+        f"Dry-run: {'on' if settings.dry_run else 'off'}\n"
+        f"Last error: {escape(state.last_error or 'нет')}\n"
+        f"Uptime: {_format_uptime(state.started_at)}\n"
+        f"Processed count: {state.processed_count}\n"
+        f"Matched count: {state.matched_count}"
+    )
+
+
+def register_bot_handlers(
+    dispatcher: Dispatcher,
+    settings: Settings,
+    state: ParserState,
+    telethon_client: Any | None = None,
+) -> None:
     router = Router()
 
     @router.message(Command("start"))
@@ -155,5 +237,15 @@ def register_bot_handlers(dispatcher: Dispatcher, settings: Settings, state: Par
 
         text = "\n".join(f"- {source}" for source in settings.source_chats)
         await message.answer(f"Текущие источники:\n{text}")
+
+    @router.message(Command("config"))
+    @_admin_only(settings)
+    async def config(message: Message) -> None:
+        await message.answer(_format_safe_config(settings, state), parse_mode="HTML")
+
+    @router.message(Command("health"))
+    @_admin_only(settings)
+    async def health(message: Message) -> None:
+        await message.answer(_format_health(settings, state, telethon_client), parse_mode="HTML")
 
     dispatcher.include_router(router)
