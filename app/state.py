@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
+from app.rules_storage import ParserRules
+
 
 @dataclass
 class ParserState:
@@ -11,6 +13,7 @@ class ParserState:
     processed_count: int = 0
     matched_count: int = 0
     last_error: str | None = None
+    rules: ParserRules = field(default_factory=ParserRules)
 
     def enable(self) -> None:
         self.enabled = True

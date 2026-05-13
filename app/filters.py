@@ -52,22 +52,22 @@ def message_matches(text: str, keywords: list[str]) -> bool:
 def should_process_message(
     text: str | None,
     source_title: str | None,
-    settings: Any,
+    rules: Any,
 ) -> tuple[bool, str | None]:
-    """Return whether a message should be processed and a skip reason if not."""
+    """Return whether a message should be processed by current parser rules."""
     if not text or not text.strip():
         return False, "empty_text"
 
-    if len(text.strip()) < settings.min_message_length:
+    if len(text.strip()) < rules.min_message_length:
         return False, "too_short"
 
-    if not source_title_allowed(source_title, settings.include_source_titles, settings.exclude_source_titles):
+    if not source_title_allowed(source_title, rules.include_source_titles, rules.exclude_source_titles):
         return False, "source_filtered"
 
-    if contains_any(text, settings.exclude_keywords):
+    if contains_any(text, rules.exclude_words):
         return False, "exclude_keyword"
 
-    if not contains_any(text, settings.keywords):
+    if not contains_any(text, rules.trigger_words):
         return False, "no_keyword"
 
     return True, None
