@@ -14,6 +14,7 @@ from app.filters import should_process_message
 from app.leads_storage import append_lead
 from app.models import LeadEvent
 from app.notifier import send_lead_notification
+from app.rules_storage import load_rules
 from app.state import ParserState
 from app.storage import load_processed, save_processed
 from app.utils import build_message_link
@@ -83,7 +84,8 @@ async def _cancel_task(task: asyncio.Task[Any]) -> None:
 async def run() -> None:
     settings = load_settings()
     _configure_logging(settings.log_level)
-    state = ParserState(enabled=settings.parser_enabled)
+    rules = load_rules(settings.rules_file, settings)
+    state = ParserState(enabled=settings.parser_enabled, rules=rules)
     processed = load_processed(settings.dedup_file)
     logger.info("Loaded %s processed message keys.", len(processed))
 
@@ -106,16 +108,18 @@ async def run() -> None:
                 logger.debug("Parser is paused. Skipping message %s.", message_id)
                 return
 
-            if settings.ignore_bots and getattr(sender, "bot", False):
+            rules = state.rules
+
+            if rules.ignore_bots and getattr(sender, "bot", False):
                 logger.debug("Skipping message %s: bot sender.", message_id)
                 return
 
-            if settings.ignore_forwards and _is_forwarded(event.message):
+            if rules.ignore_forwards and _is_forwarded(event.message):
                 logger.debug("Skipping message %s: forwarded message.", message_id)
                 return
 
             text = event.message.message or ""
-            should_process, skip_reason = should_process_message(text, source_title, settings)
+            should_process, skip_reason = should_process_message(text, source_title, rules)
             if not should_process:
                 logger.debug("Skipping message %s: %s.", message_id, skip_reason)
                 return

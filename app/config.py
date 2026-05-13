@@ -17,6 +17,7 @@ class Settings(BaseModel):
     keywords: list[str]
     dedup_file: str
     leads_file: str
+    rules_file: str
     parser_enabled: bool
     admin_ids: list[int]
     dry_run: bool
@@ -29,7 +30,7 @@ class Settings(BaseModel):
     max_text_length: int
     log_level: str
 
-    @field_validator("api_hash", "session_name", "bot_token", "dedup_file", "leads_file")
+    @field_validator("api_hash", "session_name", "bot_token", "dedup_file", "leads_file", "rules_file")
     @classmethod
     def _not_empty(cls, value: str, info: Any) -> str:
         value = value.strip()
@@ -137,6 +138,7 @@ def load_settings() -> Settings:
         "keywords": _parse_csv(os.getenv("KEYWORDS")),
         "dedup_file": _require_env("DEDUP_FILE"),
         "leads_file": _optional_env("LEADS_FILE", "data/leads.jsonl"),
+        "rules_file": _optional_env("RULES_FILE", "data/parser_rules.json"),
         "parser_enabled": _parse_bool(os.getenv("PARSER_ENABLED"), True),
         "admin_ids": _parse_int_csv(os.getenv("ADMIN_IDS")),
         "dry_run": _parse_bool(os.getenv("DRY_RUN"), False),

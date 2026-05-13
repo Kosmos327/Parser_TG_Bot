@@ -14,8 +14,8 @@ def _settings(**overrides):
         "min_message_length": 10,
         "include_source_titles": [],
         "exclude_source_titles": [],
-        "exclude_keywords": [],
-        "keywords": ["как понизить налоги"],
+        "exclude_words": [],
+        "trigger_words": ["как понизить налоги"],
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -64,7 +64,7 @@ def test_should_process_message_too_short() -> None:
 
 
 def test_should_process_message_exclude_keyword() -> None:
-    settings = _settings(exclude_keywords=["не актуально"])
+    settings = _settings(exclude_words=["не актуально"])
     assert should_process_message("как понизить налоги? не актуально", "Налоги", settings) == (
         False,
         "exclude_keyword",
