@@ -8,8 +8,10 @@ from typing import Any
 from aiogram import Dispatcher, Router
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from telethon import utils
 
 from app.config import Settings
+from app.dialogs import dialog_info_from_entity, format_dialog_bot_item
 from app.leads_storage import count_leads, get_last_leads
 from app.models import LeadEvent
 from app.rules_storage import LIST_FIELDS, add_rule_item, remove_rule_item, save_rules, set_rule_value
@@ -66,6 +68,7 @@ def _format_help() -> str:
         "/rules — открыть правила парсинга\n"
         "/config — безопасная конфигурация\n"
         "/health — состояние polling, Telethon и парсера\n"
+        "/dialogs — показать чаты/каналы, доступные Telethon-сессии\n"
         "/help — список команд"
     )
 
@@ -252,6 +255,50 @@ def _clear_confirm_markup(category: str) -> InlineKeyboardMarkup:
     )
 
 
+def _is_telethon_connected(client: Any | None) -> bool:
+    if client is None:
+        return False
+
+    try:
+        return bool(client.is_connected())
+    except Exception:
+        return False
+
+
+async def _format_available_dialogs(client: Any, limit: int = 20, max_length: int = 3800) -> str:
+    parts = ["<b>📡 Доступные источники</b>"]
+    count = 0
+    has_more = False
+
+    async for dialog in client.iter_dialogs(limit=limit + 1):
+        if count >= limit:
+            has_more = True
+            break
+
+        entity = dialog.entity
+        info = dialog_info_from_entity(entity, peer_id=utils.get_peer_id(entity))
+        item = format_dialog_bot_item(info, count + 1)
+        candidate = "\n\n".join([*parts, item])
+        if len(candidate) > max_length:
+            has_more = True
+            break
+        parts.append(item)
+        count += 1
+
+    if count == 0:
+        return "<b>📡 Доступные источники</b>\n\nДиалоги не найдены."
+
+    if has_more:
+        footer = (
+            f"Показаны первые {count}. Полный список можно получить командой:\n"
+            "<code>python list_dialogs.py --limit 500</code>"
+        )
+        candidate = "\n\n".join([*parts, footer])
+        if len(candidate) <= max_length:
+            return candidate
+    return "\n\n".join(parts)
+
+
 def _telethon_status(client: Any | None) -> str:
     if client is None:
         return "unknown"
@@ -384,6 +431,24 @@ def register_bot_handlers(
     @_admin_only(settings)
     async def health(message: Message) -> None:
         await message.answer(_format_health(settings, state, telethon_client), parse_mode="HTML")
+
+    @router.message(Command("dialogs"))
+    @_admin_only(settings)
+    async def dialogs(message: Message) -> None:
+        if telethon_client is None:
+            await message.answer("Telethon client недоступен. Запустите приложение через python -m app.main.")
+            return
+        if not _is_telethon_connected(telethon_client):
+            await message.answer("Telethon client не подключён. Проверьте /health и перезапустите приложение при необходимости.")
+            return
+
+        try:
+            text = await _format_available_dialogs(telethon_client)
+        except Exception as exc:
+            await message.answer(f"Не удалось получить список диалогов Telethon: {escape(str(exc))}", parse_mode="HTML")
+            return
+
+        await message.answer(text, parse_mode="HTML")
 
     @router.callback_query(lambda callback: callback.data == "rules:menu")
     async def rules_menu_callback(callback: CallbackQuery) -> None:
