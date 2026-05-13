@@ -16,8 +16,11 @@ class Settings(BaseModel):
     source_chats: list[str]
     keywords: list[str]
     dedup_file: str
+    leads_file: str
+    parser_enabled: bool
+    admin_ids: list[int]
 
-    @field_validator("api_hash", "session_name", "bot_token", "dedup_file")
+    @field_validator("api_hash", "session_name", "bot_token", "dedup_file", "leads_file")
     @classmethod
     def _not_empty(cls, value: str, info: Any) -> str:
         value = value.strip()
@@ -45,6 +48,33 @@ def _parse_csv(value: str | None) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def _parse_int_csv(value: str | None) -> list[int]:
+    ids: list[int] = []
+    for item in _parse_csv(value):
+        try:
+            ids.append(int(item))
+        except ValueError as exc:
+            raise ValueError(f"ADMIN_IDS contains non-integer value: {item}") from exc
+    return ids
+
+
+def _parse_bool(value: str | None, default: bool) -> bool:
+    if value is None or not value.strip():
+        return default
+
+    normalized = value.strip().lower()
+    if normalized in {"true", "1", "yes", "y", "on"}:
+        return True
+    if normalized in {"false", "0", "no", "n", "off"}:
+        return False
+
+    raise ValueError(f"Invalid boolean value: {value}")
+
+
+def _optional_env(name: str, default: str) -> str:
+    return os.getenv(name, default).strip() or default
+
+
 def _require_env(name: str) -> str:
     value = os.getenv(name, "").strip()
     if not value:
@@ -65,6 +95,9 @@ def load_settings() -> Settings:
         "source_chats": _parse_csv(os.getenv("SOURCE_CHATS")),
         "keywords": _parse_csv(os.getenv("KEYWORDS")),
         "dedup_file": _require_env("DEDUP_FILE"),
+        "leads_file": _optional_env("LEADS_FILE", "data/leads.jsonl"),
+        "parser_enabled": _parse_bool(os.getenv("PARSER_ENABLED"), True),
+        "admin_ids": _parse_int_csv(os.getenv("ADMIN_IDS")),
     }
 
     try:
