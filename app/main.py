@@ -5,14 +5,18 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
-from aiogram import Bot
+from aiogram import Bot, Dispatcher
 from telethon import TelegramClient, events
 
+from app.bot_handlers import register_bot_handlers
 from app.config import Settings, load_settings
 from app.filters import message_matches
+from app.leads_storage import append_lead
 from app.models import LeadEvent
 from app.notifier import send_lead_notification
+from app.state import ParserState
 from app.storage import load_processed, save_processed
+from app.utils import build_message_link
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,13 +33,6 @@ def _source_title(chat: Any, source_id: int | None) -> str | None:
     return getattr(chat, "title", None) or getattr(chat, "username", None) or (
         f"ID {source_id}" if source_id is not None else None
     )
-
-
-def _message_link(chat: Any, message_id: int) -> str | None:
-    username = getattr(chat, "username", None)
-    if not username:
-        return None
-    return f"https://t.me/{username}/{message_id}"
 
 
 def _normalize_source_chat(value: str) -> str | int:
@@ -55,58 +52,100 @@ def _build_event_builder(settings: Settings) -> events.NewMessage:
     return events.NewMessage()
 
 
+async def _cancel_task(task: asyncio.Task[Any]) -> None:
+    if task.done():
+        return
+
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
 async def run() -> None:
     settings = load_settings()
+    state = ParserState(enabled=settings.parser_enabled)
     processed = load_processed(settings.dedup_file)
     logger.info("Loaded %s processed message keys.", len(processed))
 
     client = TelegramClient(settings.session_name, settings.api_id, settings.api_hash)
     bot = Bot(token=settings.bot_token)
+    dispatcher = Dispatcher()
+    register_bot_handlers(dispatcher, settings, state)
 
     @client.on(_build_event_builder(settings))
     async def handle_new_message(event: events.NewMessage.Event) -> None:
-        text = (event.message.message or "").strip()
-        if not message_matches(text, settings.keywords):
-            return
-
-        source_id = event.chat_id
-        message_id = event.message.id
-        key = _processed_key(source_id, message_id)
-        if key in processed:
-            logger.debug("Message %s has already been processed.", key)
-            return
-
-        chat = await event.get_chat()
-        sender = await event.get_sender()
-
-        lead = LeadEvent(
-            source_title=_source_title(chat, source_id),
-            source_id=source_id,
-            message_id=message_id,
-            sender_id=getattr(sender, "id", None),
-            sender_username=getattr(sender, "username", None),
-            sender_first_name=getattr(sender, "first_name", None),
-            text=text,
-            message_link=_message_link(chat, message_id),
-            matched_at=datetime.now(timezone.utc),
-        )
-
+        state.processed_count += 1
         try:
-            await send_lead_notification(bot, settings.admin_chat_id, lead)
-        except Exception:
-            logger.exception("Failed to send lead notification for message %s.", key)
-            return
+            if not state.enabled:
+                logger.debug("Parser is paused. Skipping message %s.", getattr(event.message, "id", None))
+                return
 
-        processed.add(key)
-        save_processed(settings.dedup_file, processed)
-        logger.info("Lead notification sent and message %s marked as processed.", key)
+            text = (event.message.message or "").strip()
+            if not message_matches(text, settings.keywords):
+                return
+
+            source_id = event.chat_id
+            message_id = event.message.id
+            key = _processed_key(source_id, message_id)
+            if key in processed:
+                logger.debug("Message %s has already been processed.", key)
+                return
+
+            chat = await event.get_chat()
+            sender = await event.get_sender()
+
+            lead = LeadEvent(
+                source_title=_source_title(chat, source_id),
+                source_id=source_id,
+                message_id=message_id,
+                sender_id=getattr(sender, "id", None),
+                sender_username=getattr(sender, "username", None),
+                sender_first_name=getattr(sender, "first_name", None),
+                text=text,
+                message_link=build_message_link(chat, source_id, message_id),
+                matched_at=datetime.now(timezone.utc),
+            )
+
+            append_lead(settings.leads_file, lead)
+            await send_lead_notification(bot, settings.admin_chat_id, lead)
+
+            state.matched_count += 1
+            processed.add(key)
+            save_processed(settings.dedup_file, processed)
+            logger.info("Lead saved, notification sent, and message %s marked as processed.", key)
+        except Exception as exc:
+            state.last_error = str(exc)
+            logger.exception("Failed to process incoming message.")
+
+    telethon_task: asyncio.Task[Any] | None = None
+    polling_task: asyncio.Task[Any] | None = None
 
     try:
         await client.start()
         logger.info("Parser started. Press Ctrl+C to stop.")
-        await client.run_until_disconnected()
+        telethon_task = asyncio.create_task(client.run_until_disconnected(), name="telethon")
+        polling_task = asyncio.create_task(dispatcher.start_polling(bot), name="aiogram-polling")
+
+        done, pending = await asyncio.wait(
+            {telethon_task, polling_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in done:
+            task.result()
+        for task in pending:
+            await _cancel_task(task)
     finally:
         logger.info("Stopping parser and closing network sessions.")
+        if polling_task is not None:
+            await _cancel_task(polling_task)
+        if telethon_task is not None:
+            await _cancel_task(telethon_task)
+        try:
+            await dispatcher.stop_polling()
+        except RuntimeError:
+            pass
         await bot.session.close()
         await client.disconnect()
 

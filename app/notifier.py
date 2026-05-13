@@ -8,26 +8,33 @@ from app.models import LeadEvent
 
 
 def _format_user(lead: LeadEvent) -> str:
-    parts: list[str] = []
     if lead.sender_username:
-        parts.append(f"@{escape(lead.sender_username)}")
+        return f"@{escape(lead.sender_username)}"
+
     if lead.sender_first_name:
-        parts.append(escape(lead.sender_first_name))
+        first_name = escape(lead.sender_first_name)
+        if lead.sender_id is not None:
+            return f"{first_name} / ID {lead.sender_id}"
+        return first_name
+
     if lead.sender_id is not None:
-        parts.append(f"ID {lead.sender_id}")
-    return " / ".join(parts) if parts else "неизвестно"
+        return f"ID {lead.sender_id}"
+
+    return "неизвестно"
 
 
 async def send_lead_notification(bot: Bot, admin_chat_id: int, lead: LeadEvent) -> None:
     source = lead.source_title or (f"ID {lead.source_id}" if lead.source_id is not None else "неизвестно")
-    message_link = escape(lead.message_link) if lead.message_link else "недоступна"
+    message_link = escape(lead.message_link) if lead.message_link else "нет публичной ссылки"
+    date_text = lead.matched_at.strftime("%Y-%m-%d %H:%M:%S %Z")
 
     message = (
         "🚨 <b>Найдена потенциальная заявка</b>\n\n"
         f"<b>Источник:</b> {escape(source)}\n"
         f"<b>Пользователь:</b> {_format_user(lead)}\n"
+        f"<b>Дата:</b> {escape(date_text)}\n\n"
         "<b>Текст:</b>\n"
-        f"{escape(lead.text)}\n"
+        f"{escape(lead.text)}\n\n"
         f"<b>Ссылка:</b> {message_link}"
     )
 
