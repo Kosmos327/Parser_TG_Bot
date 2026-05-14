@@ -85,8 +85,8 @@ def test_format_pending_debug_includes_action_keys_counts_and_search_text() -> N
         "timestamp": "2026-05-14T00:00:00+00:00",
     })
 
-    assert "pending: yes" in text
-    assert f"action: {PENDING_LEAD_SEARCH}" in text
-    assert "source_values_count: 2" in text
-    assert "search_text: бухгалтерия" in text
-    assert "timestamp: 2026-05-14T00:00:00+00:00" in text
+    assert "Ожидающее действие: да" in text
+    assert f"Действие: {PENDING_LEAD_SEARCH}" in text
+    assert "Источников в ожидании: 2" in text
+    assert "Текст поиска: бухгалтерия" in text
+    assert "Создано: 2026-05-14T00:00:00+00:00" in text

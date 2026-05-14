@@ -12,6 +12,7 @@ from app.auto_sources import auto_source_discovery_loop
 from app.bot_handlers import register_bot_handlers
 from app.config import Settings, load_settings, risky_settings_warnings
 from app.dialogs import is_source_dialog_allowed
+from app.source_search_settings import load_source_search_settings
 from app.filters import evaluate_lead_match
 from app.lead_dedup import is_duplicate_lead
 from app.leads_storage import append_lead
@@ -110,8 +111,9 @@ async def run() -> None:
             sender = await event.get_sender()
             source_title = _source_title(chat, source_id)
 
-            if not is_source_dialog_allowed(chat, settings.exclude_private_chats):
-                logger.debug("Skipping message %s: private user dialog is excluded.", message_id)
+            source_search_settings = load_source_search_settings(settings.source_search_settings_file, settings)
+            if not is_source_dialog_allowed(chat, source_settings=source_search_settings):
+                logger.debug("Skipping message %s: source type is disabled in search settings.", message_id)
                 return
 
             if not state.enabled:

@@ -15,12 +15,12 @@ from app.source_joiner import join_sources_limited, public_username_sources
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Safely join a limited batch of public Telegram sources.")
-    parser.add_argument("sources", nargs="*", help="@username or t.me links. If empty, read --file or stdin.")
-    parser.add_argument("--file", help="Read sources from a TXT list or JSON source candidates file.")
-    parser.add_argument("--max-join", type=int, help="Override JOIN_BATCH_LIMIT for this run.")
-    parser.add_argument("--delay", type=int, help="Override JOIN_DELAY_SECONDS for this run.")
-    parser.add_argument("--dry-run", action="store_true", help="Print normalized sources without joining.")
+    parser = argparse.ArgumentParser(description="Безопасно подписаться на ограниченную партию публичных Telegram-источников.")
+    parser.add_argument("sources", nargs="*", help="@username или t.me-ссылки. Если пусто, читается --file или stdin.")
+    parser.add_argument("--file", help="Прочитать источники из TXT или JSON-файла найденных источников.")
+    parser.add_argument("--max-join", type=int, help="Переопределить лимит подписок за этот запуск.")
+    parser.add_argument("--delay", type=int, help="Переопределить задержку между подписками за этот запуск.")
+    parser.add_argument("--dry-run", action="store_true", help="Показать источники без реальной подписки.")
     return parser.parse_args()
 
 
@@ -60,10 +60,10 @@ async def main() -> int:
 
     if args.dry_run:
         normalized = public_username_sources(sources, max_join)
-        print("Dry run. Sources to join:")
+        print("Тестовый режим. Источники для подписки:")
         for source in normalized:
             print(source)
-        print(f"Total: {len(normalized)}")
+        print(f"Всего: {len(normalized)}")
         return 0
 
     client = TelegramClient(settings.session_name, settings.api_id, settings.api_hash)

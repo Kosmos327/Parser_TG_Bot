@@ -32,9 +32,9 @@ def _status_counts(settings: Any) -> dict[str, int]:
 def build_stats(settings: Any, state: Any) -> dict[str, Any]:
     stats = _status_counts(settings)
     stats.update({
-        "duplicate_count": getattr(state, "duplicate_count", 0),
-        "processed_count": getattr(state, "processed_count", 0),
-        "matched_count": getattr(state, "matched_count", 0),
+        "отсеяно дублей": getattr(state, "duplicate_count", 0),
+        "обработано сообщений": getattr(state, "processed_count", 0),
+        "найдено лидов": getattr(state, "matched_count", 0),
     })
     return stats
 
@@ -53,7 +53,7 @@ def render_index_html(settings: Any, state: Any, token: str = "") -> str:
     stats = build_stats(settings, state)
     suffix = f"?token={escape(token)}" if token else ""
     rows = "".join(f"<li>{escape(key)}: <b>{value}</b></li>" for key, value in stats.items())
-    body = f"<h1>Parser TG Bot dashboard</h1><ul>{rows}</ul><p><a href='/leads{suffix}'>Лиды</a> · <a href='/sources{suffix}'>Источники</a></p>"
+    body = f"<h1>Панель Telegram-бота</h1><ul>{rows}</ul><p><a href='/leads{suffix}'>Лиды</a> · <a href='/sources{suffix}'>Источники</a></p>"
     return _layout("Dashboard", body)
 
 
@@ -75,14 +75,14 @@ def render_leads_html(settings: Any) -> str:
             f"<td>{escape(comment or '')}</td>"
             "</tr>"
         )
-    body = "<h1>Лиды</h1><table><tr><th>Дата</th><th>Статус</th><th>Username</th><th>Source</th><th>Score</th><th>Текст</th><th>Ссылка</th><th>Комментарий</th></tr>" + "".join(rows) + "</table>"
+    body = "<h1>Лиды</h1><table><tr><th>Дата</th><th>Статус</th><th>Username</th><th>Источник</th><th>Оценка</th><th>Текст</th><th>Ссылка</th><th>Комментарий</th></tr>" + "".join(rows) + "</table>"
     return _layout("Leads", body)
 
 
 def render_sources_html(settings: Any) -> str:
     rows = []
     for candidate in load_candidates(settings.source_candidates_file):
-        status = "joined" if candidate.get("joined") else "skipped" if candidate.get("skipped") else "manual" if candidate.get("manual_required") else "error" if candidate.get("error") else "new"
+        status = "подписан" if candidate.get("joined") else "пропущен" if candidate.get("skipped") else "нужно вручную" if candidate.get("manual_required") else "ошибка" if candidate.get("error") else "новый"
         rows.append(
             "<tr>"
             f"<td>{escape(str(candidate.get('title') or ''))}</td>"
@@ -90,7 +90,7 @@ def render_sources_html(settings: Any) -> str:
             f"<td>{escape(status)}</td>"
             "</tr>"
         )
-    body = "<h1>Источники</h1><table><tr><th>Title</th><th>Username</th><th>Status</th></tr>" + "".join(rows) + "</table>"
+    body = "<h1>Источники</h1><table><tr><th>Название</th><th>Username</th><th>Статус</th></tr>" + "".join(rows) + "</table>"
     return _layout("Sources", body)
 
 

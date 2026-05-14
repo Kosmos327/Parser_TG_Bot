@@ -7,7 +7,7 @@ from typing import Any
 
 from telethon import functions, utils
 
-from app.dialogs import is_private_user_entity, normalize_username, source_chats_value
+from app.dialogs import detect_source_type, is_allowed_by_source_search_settings, is_private_user_entity, normalize_username, source_chats_value, source_type_label
 
 _TME_RE = re.compile(r"^(?:https?://)?(?:www\.)?t\.me/", re.IGNORECASE)
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{5,32}$")
@@ -24,8 +24,11 @@ def _public_username(value: Any) -> str | None:
     return f"@{text}"
 
 
-def _candidate_from_entity(entity: Any, query: str) -> dict[str, Any] | None:
-    if is_private_user_entity(entity):
+def _candidate_from_entity(entity: Any, query: str, source_settings: Any | None = None) -> dict[str, Any] | None:
+    if source_settings is not None:
+        if not is_allowed_by_source_search_settings(entity, source_settings):
+            return None
+    elif is_private_user_entity(entity):
         return None
 
     username = normalize_username(getattr(entity, "username", None))
@@ -33,11 +36,15 @@ def _candidate_from_entity(entity: Any, query: str) -> dict[str, Any] | None:
     title = getattr(entity, "title", None) or getattr(entity, "username", None) or "без названия"
     participants_count = getattr(entity, "participants_count", None)
 
+    source_type = detect_source_type(entity)
+
     return {
         "title": str(title),
         "username": username[1:] if username else None,
         "id": entity_id,
         "type": type(entity).__name__,
+        "source_type": source_type,
+        "source_type_label": source_type_label(source_type),
         "participants_count": participants_count,
         "source_chats_value": source_chats_value(username, utils.get_peer_id(entity) if entity_id is not None else None),
         "query": query,
@@ -48,7 +55,7 @@ def _candidate_from_entity(entity: Any, query: str) -> dict[str, Any] | None:
     }
 
 
-async def search_sources(client: Any, queries: list[str], limit: int) -> list[dict[str, Any]]:
+async def search_sources(client: Any, queries: list[str], limit: int, source_settings: Any | None = None) -> list[dict[str, Any]]:
     """Search public Telegram sources with Telethon and return serializable candidates."""
     candidates: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -60,7 +67,7 @@ async def search_sources(client: Any, queries: list[str], limit: int) -> list[di
             continue
         result = await client(functions.contacts.SearchRequest(q=query, limit=per_query_limit))
         for entity in list(getattr(result, "chats", [])) + list(getattr(result, "users", [])):
-            candidate = _candidate_from_entity(entity, query)
+            candidate = _candidate_from_entity(entity, query, source_settings)
             if candidate is None:
                 continue
             key = candidate.get("source_chats_value") or str(candidate.get("id"))
@@ -78,6 +85,8 @@ def export_candidates_txt(candidates: list[dict[str, Any]], path: str) -> str:
     seen: set[str] = set()
     for candidate in candidates:
         username = _public_username(candidate.get("username"))
+        if candidate.get("source_type") == "unknown":
+            continue
         if not username or username in seen:
             continue
         seen.add(username)
@@ -118,6 +127,8 @@ def filter_joinable_candidates(candidates: list[dict[str, Any]]) -> list[dict[st
     joinable: list[dict[str, Any]] = []
     for candidate in candidates:
         username = _public_username(candidate.get("source_chats_value")) or _public_username(candidate.get("username"))
+        if candidate.get("source_type") == "unknown":
+            continue
         if not username:
             continue
         if candidate.get("joined") or candidate.get("skipped") or candidate.get("manual_required") or candidate.get("error"):

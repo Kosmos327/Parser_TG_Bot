@@ -23,7 +23,7 @@ async def main() -> None:
 
     async with TelegramClient(session_name, api_id, api_hash) as client:
         me = await client.get_me()
-        print("Telethon user session is ready.")
+        print("Telegram-сессия готова.")
         print(f"User ID: {me.id}")
         print(f"First name: {me.first_name or ''}")
         print(f"Username: {me.username or ''}")
