@@ -3,8 +3,10 @@ from __future__ import annotations
 from html import escape
 
 from aiogram import Bot
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from app.models import LeadEvent
+from app.lead_index import ensure_lead_identity
+from app.models import LeadCRMStatus, LeadEvent
 
 TELEGRAM_SAFE_MESSAGE_LENGTH = 3900
 
@@ -37,6 +39,68 @@ def _truncate_text(text: str, max_length: int | None) -> str:
     if max_length == 1:
         return "…"
     return f"{text[: max_length - 1]}…"
+
+
+STATUS_TITLES = {
+    "new": "Новый",
+    "in_work": "В работе",
+    "processed": "Обработан",
+    "no_target": "Нецелевой",
+}
+
+
+def build_lead_actions_markup(lead: LeadEvent) -> InlineKeyboardMarkup:
+    lead = ensure_lead_identity(lead)
+    key = lead.lead_key
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🟡 В работу", callback_data=f"lead:in_work:{key}"),
+                InlineKeyboardButton(text="✅ Обработан", callback_data=f"lead:processed:{key}"),
+            ],
+            [
+                InlineKeyboardButton(text="💬 Комментарий", callback_data=f"lead:comment:{key}"),
+                InlineKeyboardButton(text="📅 Дата обработки", callback_data=f"lead:date:{key}"),
+            ],
+            [
+                InlineKeyboardButton(text="❌ Нецелевой", callback_data=f"lead:no_target:{key}"),
+                InlineKeyboardButton(text="📄 Карточка", callback_data=f"lead:card:{key}"),
+            ],
+        ]
+    )
+
+
+def _format_assignee(crm: LeadCRMStatus) -> str:
+    if crm.assigned_to_username:
+        return _format_login(crm.assigned_to_username)
+    if crm.assigned_to_user_id is not None:
+        return _escape_field(crm.assigned_to_user_id)
+    return "нет"
+
+
+def build_lead_card_text(lead: LeadEvent, crm: LeadCRMStatus) -> str:
+    lead = ensure_lead_identity(lead)
+    text = _truncate_text(lead.text.strip(), 1200)
+    comment = _truncate_text(crm.comment or "нет", 1000)
+    date_found = escape(lead.matched_at.strftime("%d.%m.%Y %H:%M"))
+    source = _format_optional_field(lead.source_title, "неизвестно")
+    message_link = _format_optional_field(lead.message_link, "нет публичной ссылки")
+    return (
+        "📄 <b>Карточка лида</b>\n\n"
+        f"<b>Статус:</b> {escape(STATUS_TITLES.get(crm.status, crm.status))}\n"
+        f"<b>Логин:</b> {_format_login(lead.sender_username)}\n"
+        f"<b>Имя:</b> {_format_optional_field(lead.sender_first_name, 'нет')}\n"
+        f"<b>ID пользователя:</b> {_format_optional_field(lead.sender_id, 'нет')}\n"
+        f"<b>Дата найденного сообщения:</b> {date_found}\n"
+        f"<b>Дата обработки:</b> {escape(crm.processed_date or 'нет')}\n"
+        f"<b>Ответственный:</b> {_format_assignee(crm)}\n"
+        f"<b>Источник:</b> {source}\n"
+        f"<b>Ссылка:</b> {message_link}\n\n"
+        "<b>Сообщение:</b>\n"
+        f"{escape(text) if text else 'нет'}\n\n"
+        "<b>Комментарий:</b>\n"
+        f"{escape(comment)}"
+    )
 
 
 def _build_message(lead: LeadEvent, text: str) -> str:
@@ -100,5 +164,12 @@ async def send_lead_notification(
     lead: LeadEvent,
     max_text_length: int | None = None,
 ) -> None:
+    lead = ensure_lead_identity(lead)
     message = build_lead_notification_text(lead, max_text_length=max_text_length)
-    await bot.send_message(admin_chat_id, message, parse_mode="HTML", disable_web_page_preview=True)
+    await bot.send_message(
+        admin_chat_id,
+        message,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=build_lead_actions_markup(lead),
+    )

@@ -17,6 +17,7 @@ class Settings(BaseModel):
     keywords: list[str]
     dedup_file: str
     leads_file: str
+    crm_file: str
     rules_file: str
     parser_enabled: bool
     admin_ids: list[int]
@@ -35,6 +36,7 @@ class Settings(BaseModel):
     exclude_private_chats: bool
     source_candidates_file: str
     source_export_file: str
+    leads_page_size: int
 
     @field_validator(
         "api_hash",
@@ -43,6 +45,7 @@ class Settings(BaseModel):
         "dedup_file",
         "leads_file",
         "rules_file",
+        "crm_file",
         "source_candidates_file",
         "source_export_file",
     )
@@ -86,6 +89,14 @@ class Settings(BaseModel):
         if value < 1:
             raise ValueError(f"{info.field_name} must be greater than 0")
         return value
+
+
+    @field_validator("leads_page_size")
+    @classmethod
+    def _leads_page_size_valid(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("leads_page_size must be greater than 0")
+        return min(value, 20)
 
     @field_validator("log_level")
     @classmethod
@@ -170,6 +181,7 @@ def load_settings() -> Settings:
         "keywords": _parse_csv(os.getenv("KEYWORDS")),
         "dedup_file": _require_env("DEDUP_FILE"),
         "leads_file": _optional_env("LEADS_FILE", "data/leads.jsonl"),
+        "crm_file": _optional_env("CRM_FILE", "data/lead_crm.json"),
         "rules_file": _optional_env("RULES_FILE", "data/parser_rules.json"),
         "parser_enabled": _parse_bool(os.getenv("PARSER_ENABLED"), True),
         "admin_ids": _parse_int_csv(os.getenv("ADMIN_IDS")),
@@ -188,6 +200,7 @@ def load_settings() -> Settings:
         "exclude_private_chats": _parse_bool(os.getenv("EXCLUDE_PRIVATE_CHATS"), True),
         "source_candidates_file": _optional_env("SOURCE_CANDIDATES_FILE", "data/source_candidates.json"),
         "source_export_file": _optional_env("SOURCE_EXPORT_FILE", "data/source_candidates.txt"),
+        "leads_page_size": _parse_int(os.getenv("LEADS_PAGE_SIZE"), 10, "LEADS_PAGE_SIZE"),
     }
 
     try:
