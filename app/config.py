@@ -37,6 +37,19 @@ class Settings(BaseModel):
     source_candidates_file: str
     source_export_file: str
     leads_page_size: int
+    lead_dedup_enabled: bool
+    lead_dedup_window_hours: int
+    lead_dedup_similarity_threshold: float
+    auto_source_discovery_enabled: bool
+    auto_source_discovery_queries: list[str]
+    auto_source_discovery_interval_hours: int
+    auto_source_discovery_limit: int
+    auto_source_auto_join: bool
+    auto_source_join_limit: int
+    web_dashboard_enabled: bool
+    web_dashboard_host: str
+    web_dashboard_port: int
+    web_dashboard_token: str
 
     @field_validator(
         "api_hash",
@@ -83,7 +96,7 @@ class Settings(BaseModel):
             raise ValueError("max_text_length must be greater than 0")
         return value
 
-    @field_validator("source_search_limit", "join_batch_limit", "join_delay_seconds")
+    @field_validator("source_search_limit", "join_batch_limit", "join_delay_seconds", "lead_dedup_window_hours", "auto_source_discovery_interval_hours", "auto_source_discovery_limit", "auto_source_join_limit", "web_dashboard_port")
     @classmethod
     def _positive_int_valid(cls, value: int, info: Any) -> int:
         if value < 1:
@@ -98,6 +111,13 @@ class Settings(BaseModel):
             raise ValueError("leads_page_size must be greater than 0")
         return min(value, 20)
 
+    @field_validator("lead_dedup_similarity_threshold")
+    @classmethod
+    def _threshold_valid(cls, value: float) -> float:
+        if not 0 <= value <= 1:
+            raise ValueError("lead_dedup_similarity_threshold must be between 0 and 1")
+        return value
+
     @field_validator("log_level")
     @classmethod
     def _log_level_valid(cls, value: str) -> str:
@@ -111,6 +131,15 @@ def _parse_csv(value: str | None) -> list[str]:
     if not value:
         return []
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _parse_float(value: str | None, default: float, env_name: str) -> float:
+    if value is None or not value.strip():
+        return default
+    try:
+        return float(value.strip())
+    except ValueError as exc:
+        raise ValueError(f"{env_name} contains non-float value: {value}") from exc
 
 
 def _parse_int(value: str | None, default: int, env_name: str) -> int:
@@ -201,6 +230,19 @@ def load_settings() -> Settings:
         "source_candidates_file": _optional_env("SOURCE_CANDIDATES_FILE", "data/source_candidates.json"),
         "source_export_file": _optional_env("SOURCE_EXPORT_FILE", "data/source_candidates.txt"),
         "leads_page_size": _parse_int(os.getenv("LEADS_PAGE_SIZE"), 10, "LEADS_PAGE_SIZE"),
+        "lead_dedup_enabled": _parse_bool(os.getenv("LEAD_DEDUP_ENABLED"), True),
+        "lead_dedup_window_hours": _parse_int(os.getenv("LEAD_DEDUP_WINDOW_HOURS"), 72, "LEAD_DEDUP_WINDOW_HOURS"),
+        "lead_dedup_similarity_threshold": _parse_float(os.getenv("LEAD_DEDUP_SIMILARITY_THRESHOLD"), 0.90, "LEAD_DEDUP_SIMILARITY_THRESHOLD"),
+        "auto_source_discovery_enabled": _parse_bool(os.getenv("AUTO_SOURCE_DISCOVERY_ENABLED"), False),
+        "auto_source_discovery_queries": _parse_csv(os.getenv("AUTO_SOURCE_DISCOVERY_QUERIES")) or ["налоги", "бухгалтерия", "ип"],
+        "auto_source_discovery_interval_hours": _parse_int(os.getenv("AUTO_SOURCE_DISCOVERY_INTERVAL_HOURS"), 24, "AUTO_SOURCE_DISCOVERY_INTERVAL_HOURS"),
+        "auto_source_discovery_limit": _parse_int(os.getenv("AUTO_SOURCE_DISCOVERY_LIMIT"), 50, "AUTO_SOURCE_DISCOVERY_LIMIT"),
+        "auto_source_auto_join": _parse_bool(os.getenv("AUTO_SOURCE_AUTO_JOIN"), False),
+        "auto_source_join_limit": _parse_int(os.getenv("AUTO_SOURCE_JOIN_LIMIT"), 5, "AUTO_SOURCE_JOIN_LIMIT"),
+        "web_dashboard_enabled": _parse_bool(os.getenv("WEB_DASHBOARD_ENABLED"), False),
+        "web_dashboard_host": _optional_env("WEB_DASHBOARD_HOST", "127.0.0.1"),
+        "web_dashboard_port": _parse_int(os.getenv("WEB_DASHBOARD_PORT"), 8088, "WEB_DASHBOARD_PORT"),
+        "web_dashboard_token": os.getenv("WEB_DASHBOARD_TOKEN", "").strip(),
     }
 
     try:

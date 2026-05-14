@@ -8,10 +8,12 @@ from typing import Any
 from aiogram import Bot, Dispatcher
 from telethon import TelegramClient, events
 
+from app.auto_sources import auto_source_discovery_loop
 from app.bot_handlers import register_bot_handlers
 from app.config import Settings, load_settings, risky_settings_warnings
 from app.dialogs import is_source_dialog_allowed
-from app.filters import should_process_message
+from app.filters import evaluate_lead_match
+from app.lead_dedup import is_duplicate_lead
 from app.leads_storage import append_lead
 from app.models import LeadEvent
 from app.notifier import send_lead_notification
@@ -19,6 +21,7 @@ from app.rules_storage import load_rules
 from app.state import ParserState
 from app.storage import load_processed, save_processed
 from app.utils import build_message_link
+from app.web_dashboard import start_web_dashboard
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +98,7 @@ async def run() -> None:
     client = TelegramClient(settings.session_name, settings.api_id, settings.api_hash)
     bot = Bot(token=settings.bot_token)
     dispatcher = Dispatcher()
-    register_bot_handlers(dispatcher, settings, state, telethon_client=client)
+    register_bot_handlers(dispatcher, settings, state, telethon_client=client, bot=bot)
 
     @client.on(_build_event_builder(settings))
     async def handle_new_message(event: events.NewMessage.Event) -> None:
@@ -126,9 +129,9 @@ async def run() -> None:
                 return
 
             text = event.message.message or ""
-            should_process, skip_reason = should_process_message(text, source_title, rules)
-            if not should_process:
-                logger.debug("Skipping message %s: %s.", message_id, skip_reason)
+            match = evaluate_lead_match(text, source_title, rules)
+            if not match.matched:
+                logger.debug("Skipping message %s: %s.", message_id, match.reason)
                 return
 
             key = _processed_key(source_id, message_id)
@@ -136,16 +139,37 @@ async def run() -> None:
                 logger.debug("Message %s has already been processed.", key)
                 return
 
+            sender_id = getattr(sender, "id", None)
+            sender_username = getattr(sender, "username", None)
+            if settings.lead_dedup_enabled:
+                duplicate, original_lead_id = is_duplicate_lead(
+                    settings.leads_file,
+                    text,
+                    sender_username,
+                    sender_id,
+                    settings.lead_dedup_window_hours,
+                    settings.lead_dedup_similarity_threshold,
+                )
+                if duplicate:
+                    state.duplicate_count += 1
+                    processed.add(key)
+                    save_processed(settings.dedup_file, processed)
+                    logger.info("duplicate lead skipped, original_lead_id=%s", original_lead_id)
+                    return
+
             lead = LeadEvent(
                 source_title=source_title,
                 source_id=source_id,
                 message_id=message_id,
-                sender_id=getattr(sender, "id", None),
-                sender_username=getattr(sender, "username", None),
+                sender_id=sender_id,
+                sender_username=sender_username,
                 sender_first_name=getattr(sender, "first_name", None),
                 text=_truncate_text(text.strip(), settings.max_text_length),
                 message_link=build_message_link(chat, source_id, message_id),
                 matched_at=datetime.now(timezone.utc),
+                score=match.score,
+                matched_phrases=match.matched_phrases,
+                negative_phrases=match.negative_phrases,
             )
 
             append_lead(settings.leads_file, lead)
@@ -170,15 +194,24 @@ async def run() -> None:
 
     telethon_task: asyncio.Task[Any] | None = None
     polling_task: asyncio.Task[Any] | None = None
+    auto_sources_task: asyncio.Task[Any] | None = None
+    dashboard_runner: Any | None = None
 
     try:
         await client.start()
         logger.info("Parser started. Press Ctrl+C to stop.")
         telethon_task = asyncio.create_task(client.run_until_disconnected(), name="telethon")
         polling_task = asyncio.create_task(dispatcher.start_polling(bot), name="aiogram-polling")
+        if settings.auto_source_discovery_enabled:
+            auto_sources_task = asyncio.create_task(auto_source_discovery_loop(settings, state, client, bot), name="auto-source-discovery")
+        if settings.web_dashboard_enabled:
+            dashboard_runner = await start_web_dashboard(settings, state)
 
+        tasks = {telethon_task, polling_task}
+        if auto_sources_task is not None:
+            tasks.add(auto_sources_task)
         done, pending = await asyncio.wait(
-            {telethon_task, polling_task},
+            tasks,
             return_when=asyncio.FIRST_COMPLETED,
         )
         for task in done:
@@ -187,6 +220,10 @@ async def run() -> None:
             await _cancel_task(task)
     finally:
         logger.info("Stopping parser and closing network sessions.")
+        if auto_sources_task is not None:
+            await _cancel_task(auto_sources_task)
+        if dashboard_runner is not None:
+            await dashboard_runner.cleanup()
         if polling_task is not None:
             await _cancel_task(polling_task)
         if telethon_task is not None:

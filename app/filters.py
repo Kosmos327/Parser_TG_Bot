@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from app.models import LeadMatchResult
+
 _SPACES_RE = re.compile(r"\s+")
 
 
@@ -15,14 +17,23 @@ def normalize_text(text: str | None) -> str:
     return _SPACES_RE.sub(" ", normalized)
 
 
-def contains_any(text: str, phrases: list[str]) -> bool:
-    """Return True when normalized text contains at least one normalized phrase."""
+def _matched_phrases(text: str, phrases: list[str]) -> list[str]:
     normalized_text = normalize_text(text)
     if not normalized_text:
-        return False
+        return []
+    matches: list[str] = []
+    seen: set[str] = set()
+    for phrase in phrases:
+        normalized = normalize_text(phrase)
+        if normalized and normalized in normalized_text and normalized not in seen:
+            matches.append(str(phrase).strip())
+            seen.add(normalized)
+    return matches
 
-    normalized_phrases = [normalize_text(phrase) for phrase in phrases]
-    return any(phrase in normalized_text for phrase in normalized_phrases if phrase)
+
+def contains_any(text: str, phrases: list[str]) -> bool:
+    """Return True when normalized text contains at least one normalized phrase."""
+    return bool(_matched_phrases(text, phrases))
 
 
 def source_title_allowed(
@@ -49,25 +60,52 @@ def message_matches(text: str, keywords: list[str]) -> bool:
     return contains_any(text, keywords)
 
 
+def evaluate_lead_match(text: str | None, source_title: str | None, rules: Any) -> LeadMatchResult:
+    """Evaluate message against parser rules and return scoring details."""
+    if not text or not text.strip():
+        return LeadMatchResult(False, 0, reason="empty_text")
+
+    if len(text.strip()) < rules.min_message_length:
+        return LeadMatchResult(False, 0, reason="too_short")
+
+    if not source_title_allowed(source_title, rules.include_source_titles, rules.exclude_source_titles):
+        return LeadMatchResult(False, 0, reason="source_filtered")
+
+    exclude_matches = _matched_phrases(text, getattr(rules, "exclude_words", []))
+    if exclude_matches:
+        return LeadMatchResult(False, 0, negative_phrases=exclude_matches, reason="exclude_keyword")
+
+    strong_words = list(getattr(rules, "strong_trigger_words", []) or [])
+    trigger_words = list(getattr(rules, "trigger_words", []) or [])
+    weak_words = list(getattr(rules, "weak_trigger_words", []) or [])
+    negative_words = list(getattr(rules, "negative_words", []) or [])
+    min_score = int(getattr(rules, "min_score", 1))
+
+    strong_matches = _matched_phrases(text, strong_words)
+    trigger_matches = _matched_phrases(text, trigger_words)
+    weak_matches = _matched_phrases(text, weak_words)
+    negative_matches = _matched_phrases(text, negative_words)
+
+    score = len(strong_matches) * 2 + len(trigger_matches) + len(weak_matches) - len(negative_matches) * 3
+    matched: list[str] = []
+    seen: set[str] = set()
+    for phrase in [*strong_matches, *trigger_matches, *weak_matches]:
+        key = normalize_text(phrase)
+        if key and key not in seen:
+            matched.append(phrase)
+            seen.add(key)
+
+    if score >= min_score:
+        return LeadMatchResult(True, score, matched_phrases=matched, negative_phrases=negative_matches)
+
+    return LeadMatchResult(False, score, matched_phrases=matched, negative_phrases=negative_matches, reason="low_score")
+
+
 def should_process_message(
     text: str | None,
     source_title: str | None,
     rules: Any,
 ) -> tuple[bool, str | None]:
     """Return whether a message should be processed by current parser rules."""
-    if not text or not text.strip():
-        return False, "empty_text"
-
-    if len(text.strip()) < rules.min_message_length:
-        return False, "too_short"
-
-    if not source_title_allowed(source_title, rules.include_source_titles, rules.exclude_source_titles):
-        return False, "source_filtered"
-
-    if contains_any(text, rules.exclude_words):
-        return False, "exclude_keyword"
-
-    if not contains_any(text, rules.trigger_words):
-        return False, "no_keyword"
-
-    return True, None
+    result = evaluate_lead_match(text, source_title, rules)
+    return result.matched, result.reason

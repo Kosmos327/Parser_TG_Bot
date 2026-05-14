@@ -32,7 +32,9 @@ def test_build_lead_notification_text_formats_application_for_admin() -> None:
         "Подскажите, как понизить налоги для ООО?\n\n"
         "<b>Дата и время:</b> 13.05.2026 17:30\n\n"
         "<b>Источник:</b> Налоги &amp; бизнес\n"
-        "<b>Ссылка:</b> https://t.me/c/1234567890/10?x=&lt;tag&gt;"
+        "<b>Ссылка:</b> https://t.me/c/1234567890/10?x=&lt;tag&gt;\n"
+        "<b>Скоринг:</b> нет\n"
+        "<b>Совпадения:</b> нет"
     )
 
 

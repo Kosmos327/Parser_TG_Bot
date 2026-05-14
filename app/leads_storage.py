@@ -44,6 +44,9 @@ def _lead_from_dict(data: dict[str, Any]) -> LeadEvent:
             matched_at=_datetime_from_json(str(data["matched_at"])),
             lead_id=str(data.get("lead_id") or ""),
             lead_key=str(data.get("lead_key") or ""),
+            score=data.get("score"),
+            matched_phrases=list(data.get("matched_phrases") or []),
+            negative_phrases=list(data.get("negative_phrases") or []),
         )
     )
 

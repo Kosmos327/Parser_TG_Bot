@@ -477,3 +477,102 @@ python -m pytest
 
 - Найденные лиды сохраняются в `data/leads.jsonl` (`LEADS_FILE`).
 - CRM-статусы, даты обработки, ответственные и комментарии сохраняются в `data/lead_crm.json` (`CRM_FILE`).
+
+## Новые возможности: качество лидов, антидубли, автопоиск и dashboard
+
+### Постоянное главное меню
+
+После `/start`, `/help` и `/menu` бот показывает постоянную Reply-кнопку `🏠 Главное меню`. Нажатие этой кнопки открывает inline-меню с действиями: поиск источников, правила парсинга, лиды/воронка, статус, health и очистка pending-state. Если бот не ждёт ввод текста и получает непонятное сообщение, он отвечает `Выберите действие в меню.` и снова показывает главное меню.
+
+### Scoring лидов
+
+В `RULES_FILE` теперь поддерживаются дополнительные поля:
+
+```json
+{
+  "trigger_words": ["налоги"],
+  "strong_trigger_words": ["налоги"],
+  "weak_trigger_words": [],
+  "negative_words": [],
+  "exclude_words": [],
+  "min_score": 1
+}
+```
+
+Правила scoring:
+
+- `strong_trigger_words`: `+2` за совпадение;
+- `trigger_words`: `+1` за совпадение;
+- `weak_trigger_words`: `+1` за совпадение;
+- `negative_words`: `-3` за совпадение;
+- `exclude_words`: мгновенный reject, как и раньше;
+- лид создаётся, если итоговый score `>= min_score`, иначе причина пропуска `low_score`.
+
+При первом создании новых правил `strong_trigger_words` заполняется текущими `KEYWORDS`/`trigger_words`. В Telegram-меню «Правила парсинга» доступны пункты для сильных/слабых триггеров, минус-слов и минимального scoring. `/config` показывает новые поля правил.
+
+### Антидубли между каналами
+
+Добавлены настройки:
+
+```env
+LEAD_DEDUP_ENABLED=true
+LEAD_DEDUP_WINDOW_HOURS=72
+LEAD_DEDUP_SIMILARITY_THRESHOLD=0.90
+```
+
+Помимо старой дедупликации `source_id:message_id`, бот сравнивает нормализованный текст и отправителя с лидами за последние `LEAD_DEDUP_WINDOW_HOURS`. Похожие сообщения одного пользователя в разных каналах не создают новый лид; счётчик `duplicate_count` виден в `/status`, `/health` и dashboard.
+
+### Автоматическое обновление источников
+
+Добавлены настройки:
+
+```env
+AUTO_SOURCE_DISCOVERY_ENABLED=false
+AUTO_SOURCE_DISCOVERY_QUERIES=налоги,бухгалтерия,ип
+AUTO_SOURCE_DISCOVERY_INTERVAL_HOURS=24
+AUTO_SOURCE_DISCOVERY_LIMIT=50
+AUTO_SOURCE_AUTO_JOIN=false
+AUTO_SOURCE_JOIN_LIMIT=5
+```
+
+Если `AUTO_SOURCE_DISCOVERY_ENABLED=true`, при запуске создаётся background task: он ищет источники по запросам, сохраняет кандидатов в `SOURCE_CANDIDATES_FILE`, экспортирует TXT и отправляет админу отчёт. При `AUTO_SOURCE_AUTO_JOIN=true` бот безопасно подписывается максимум на `AUTO_SOURCE_JOIN_LIMIT` публичных источников, используя `JOIN_DELAY_SECONDS` и не обходя FloodWait.
+
+Админ-команды:
+
+```text
+/auto_sources_status
+/auto_sources_run_now
+```
+
+### Web dashboard
+
+Добавлены настройки:
+
+```env
+WEB_DASHBOARD_ENABLED=false
+WEB_DASHBOARD_HOST=127.0.0.1
+WEB_DASHBOARD_PORT=8088
+WEB_DASHBOARD_TOKEN=
+```
+
+Если `WEB_DASHBOARD_ENABLED=true`, приложение поднимает aiohttp dashboard. Если токен задан, все endpoints требуют query-параметр `token`; если токен пустой, dashboard должен использовать local-only host `127.0.0.1` и пишет warning.
+
+Пример включения:
+
+```env
+WEB_DASHBOARD_ENABLED=true
+WEB_DASHBOARD_TOKEN=some-long-token
+```
+
+Открыть:
+
+```text
+http://127.0.0.1:8088/?token=some-long-token
+```
+
+Endpoints:
+
+- `GET /` — краткая HTML-статистика и ссылки;
+- `GET /leads?token=...` — таблица лидов;
+- `GET /sources?token=...` — таблица кандидатов источников;
+- `GET /api/stats?token=...` — JSON stats.

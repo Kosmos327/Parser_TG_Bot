@@ -12,9 +12,10 @@ from typing import Any
 
 from aiogram import Dispatcher, Router
 from aiogram.filters import Command
-from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup
 from telethon import utils
 
+from app.auto_sources import run_auto_source_discovery_once
 from app.config import Settings, risky_settings_warnings
 from app.crm_storage import get_or_create_status, get_stats as get_crm_stats, load_crm, set_comment, set_processed_date, update_status
 from app.dialogs import dialog_info_from_entity, format_dialog_bot_item, is_source_dialog_allowed
@@ -47,11 +48,16 @@ PENDING_LEAD_SEARCH = "lead_search"
 PENDING_RULE_ADD = "add"
 PENDING_RULE_REMOVE = "remove"
 PENDING_RULE_MIN_LENGTH = "min_length"
+PENDING_RULE_MIN_SCORE = "min_score"
+MAIN_MENU_BUTTON_TEXT = "🏠 Главное меню"
 
 logger = logging.getLogger(__name__)
 
 CATEGORY_TITLES = {
     "trigger_words": "Слова-триггеры",
+    "strong_trigger_words": "Сильные триггеры",
+    "weak_trigger_words": "Слабые триггеры",
+    "negative_words": "Минус-слова",
     "exclude_words": "Стоп-слова",
     "include_source_titles": "Разрешённые источники",
     "exclude_source_titles": "Исключённые источники",
@@ -80,12 +86,27 @@ def is_admin_callback(callback: CallbackQuery, settings: Settings) -> bool:
     return bool(message and message.chat.id == settings.admin_chat_id)
 
 
+def is_main_menu_text(text: str | None) -> bool:
+    return (text or "").strip() == MAIN_MENU_BUTTON_TEXT
+
+
+def main_menu_reply_markup() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=MAIN_MENU_BUTTON_TEXT)]],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
 def _rules_button_markup() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🔎 Найти новые источники", callback_data="sources:find")],
             [InlineKeyboardButton(text="⚙️ Правила парсинга", callback_data="rules:menu")],
             [InlineKeyboardButton(text="📋 Лиды / Воронка", callback_data="crm:menu")],
+            [InlineKeyboardButton(text="📊 Статус", callback_data="main:status")],
+            [InlineKeyboardButton(text="🩺 Health", callback_data="main:health")],
+            [InlineKeyboardButton(text="🧹 Очистить ожидание", callback_data="main:pending_clear")],
         ]
     )
 
@@ -94,6 +115,7 @@ def _format_help() -> str:
     return (
         "Бот управления Telegram lead parser.\n\n"
         "Команды:\n"
+        "/menu — главное меню\n"
         "/status — статус парсера\n"
         "/pause — выключить обработку новых лидов\n"
         "/resume — включить обработку новых лидов\n"
@@ -117,6 +139,8 @@ def _format_help() -> str:
         "/config — безопасная конфигурация\n"
         "/health — состояние polling, Telethon и парсера\n"
         "/dialogs — показать чаты/каналы, доступные Telethon-сессии\n"
+        "/auto_sources_status — статус автопоиска источников\n"
+        "/auto_sources_run_now — запустить автопоиск источников сейчас\n"
         "/help — список команд"
     )
 
@@ -153,6 +177,8 @@ def _format_lead(lead: LeadEvent, index: int) -> str:
         f"<b>{index}.</b> {escape(source)}\n"
         f"<b>Пользователь:</b> {escape(user)}\n"
         f"<b>Дата:</b> {escape(date_text)}\n"
+        f"<b>Скоринг:</b> {escape(str(lead.score if lead.score is not None else 'нет'))}\n"
+        f"<b>Совпадения:</b> {escape(', '.join(lead.matched_phrases) or 'нет')}\n"
         f"<b>Текст:</b> {escape(text)}\n"
         f"<b>Ссылка:</b> {escape(link)}"
     )
@@ -210,10 +236,14 @@ def _format_safe_config(settings: Settings, state: ParserState) -> str:
         f"parser_enabled: {_format_bool(state.enabled)}",
         f"dry_run: {_format_bool(settings.dry_run)}",
         _format_list("trigger_words", rules.trigger_words),
+        _format_list("strong_trigger_words", rules.strong_trigger_words),
+        _format_list("weak_trigger_words", rules.weak_trigger_words),
+        _format_list("negative_words", rules.negative_words),
         _format_list("exclude_words", rules.exclude_words),
         _format_list("include_source_titles", rules.include_source_titles),
         _format_list("exclude_source_titles", rules.exclude_source_titles),
         f"min_message_length: {rules.min_message_length}",
+        f"min_score: {rules.min_score}",
         f"ignore_bots: {_format_bool(rules.ignore_bots)}",
         f"ignore_forwards: {_format_bool(rules.ignore_forwards)}",
         _format_list("source_chats", settings.source_chats),
@@ -228,6 +258,18 @@ def _format_safe_config(settings: Settings, state: ParserState) -> str:
         f"exclude_private_chats: {_format_bool(settings.exclude_private_chats)}",
         f"source_candidates_file: {escape(settings.source_candidates_file)}",
         f"source_export_file: {escape(settings.source_export_file)}",
+        f"lead_dedup_enabled: {_format_bool(settings.lead_dedup_enabled)}",
+        f"lead_dedup_window_hours: {settings.lead_dedup_window_hours}",
+        f"lead_dedup_similarity_threshold: {settings.lead_dedup_similarity_threshold}",
+        f"auto_source_discovery_enabled: {_format_bool(settings.auto_source_discovery_enabled)}",
+        _format_list("auto_source_discovery_queries", settings.auto_source_discovery_queries),
+        f"auto_source_discovery_interval_hours: {settings.auto_source_discovery_interval_hours}",
+        f"auto_source_discovery_limit: {settings.auto_source_discovery_limit}",
+        f"auto_source_auto_join: {_format_bool(settings.auto_source_auto_join)}",
+        f"auto_source_join_limit: {settings.auto_source_join_limit}",
+        f"web_dashboard_enabled: {_format_bool(settings.web_dashboard_enabled)}",
+        f"web_dashboard_host: {escape(settings.web_dashboard_host)}",
+        f"web_dashboard_port: {settings.web_dashboard_port}",
     ]
     warnings = risky_settings_warnings(settings)
     if warnings:
@@ -242,12 +284,16 @@ def _format_rules_menu(state: ParserState) -> str:
         "⚙️ <b>Правила парсинга</b>\n\n"
         "Критерии:\n"
         f"1. Слова-триггеры: {len(rules.trigger_words)}\n"
-        f"2. Стоп-слова: {len(rules.exclude_words)}\n"
-        f"3. Разрешённые источники: {len(rules.include_source_titles)}\n"
-        f"4. Исключённые источники: {len(rules.exclude_source_titles)}\n"
-        f"5. Мин. длина сообщения: {rules.min_message_length}\n"
-        f"6. Игнорировать ботов: {_format_yes_no(rules.ignore_bots)}\n"
-        f"7. Игнорировать пересланные: {_format_yes_no(rules.ignore_forwards)}"
+        f"2. Сильные триггеры: {len(rules.strong_trigger_words)}\n"
+        f"3. Слабые триггеры: {len(rules.weak_trigger_words)}\n"
+        f"4. Минус-слова: {len(rules.negative_words)}\n"
+        f"5. Стоп-слова: {len(rules.exclude_words)}\n"
+        f"6. Разрешённые источники: {len(rules.include_source_titles)}\n"
+        f"7. Исключённые источники: {len(rules.exclude_source_titles)}\n"
+        f"8. Мин. длина сообщения: {rules.min_message_length}\n"
+        f"9. Минимальный скоринг: {rules.min_score}\n"
+        f"10. Игнорировать ботов: {_format_yes_no(rules.ignore_bots)}\n"
+        f"11. Игнорировать пересланные: {_format_yes_no(rules.ignore_forwards)}"
     )
 
 
@@ -256,10 +302,14 @@ def _rules_menu_markup(state: ParserState) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🔥 Слова-триггеры", callback_data="rules:list:trigger_words")],
-            [InlineKeyboardButton(text="⛔ Стоп-слова", callback_data="rules:list:exclude_words")],
+            [InlineKeyboardButton(text="💪 Сильные триггеры", callback_data="rules:list:strong_trigger_words")],
+            [InlineKeyboardButton(text="🌱 Слабые триггеры", callback_data="rules:list:weak_trigger_words")],
+            [InlineKeyboardButton(text="⛔ Минус-слова", callback_data="rules:list:negative_words")],
+            [InlineKeyboardButton(text="🚫 Стоп-слова", callback_data="rules:list:exclude_words")],
             [InlineKeyboardButton(text="✅ Разрешённые источники", callback_data="rules:list:include_source_titles")],
             [InlineKeyboardButton(text="🚫 Исключённые источники", callback_data="rules:list:exclude_source_titles")],
             [InlineKeyboardButton(text="📏 Мин. длина", callback_data="rules:min_length")],
+            [InlineKeyboardButton(text="🎯 Минимальный скоринг", callback_data="rules:min_score")],
             [
                 InlineKeyboardButton(
                     text=f"🤖 Игнорировать ботов: {_format_yes_no(rules.ignore_bots)}",
@@ -383,8 +433,11 @@ def _format_health(settings: Settings, state: ParserState, client: Any | None) -
         f"Uptime: {_format_uptime(state.started_at)}\n"
         f"Processed count: {state.processed_count}\n"
         f"Matched count: {state.matched_count}\n"
+        f"Duplicate count: {state.duplicate_count}\n"
         f"Source join: {'in progress' if state.source_join_in_progress else 'idle'}\n"
-        f"Source join last report: {escape(state.source_join_last_report or 'нет')}"
+        f"Source join last report: {escape(state.source_join_last_report or 'нет')}\n"
+        f"Auto source discovery: {'in progress' if state.auto_source_discovery_in_progress else 'idle'}\n"
+        f"Auto source discovery last report: {escape(state.auto_source_discovery_last_report or 'нет')}"
         + escape(_crm_status_appendix(settings))
     )
 
@@ -704,10 +757,15 @@ def register_bot_handlers(
     settings: Settings,
     state: ParserState,
     telethon_client: Any | None = None,
+    bot: Any | None = None,
 ) -> None:
     router = Router()
     pending: dict[int, PendingState] = {}
     search_queries: dict[str, str] = {}
+
+    async def send_main_menu(message: Message, text: str | None = None) -> None:
+        await message.answer(text or "Выберите действие в меню.", reply_markup=main_menu_reply_markup())
+        await message.answer("Главное меню:", reply_markup=_rules_button_markup())
 
     async def send_rules_menu(message: Message) -> None:
         await message.answer(_format_rules_menu(state), reply_markup=_rules_menu_markup(state), parse_mode="HTML")
@@ -947,12 +1005,17 @@ def register_bot_handlers(
     @router.message(Command("start"))
     @_admin_only(settings)
     async def start(message: Message) -> None:
-        await message.answer(_format_help(), reply_markup=_rules_button_markup())
+        await send_main_menu(message, _format_help())
 
     @router.message(Command("help"))
     @_admin_only(settings)
     async def help_command(message: Message) -> None:
-        await message.answer(_format_help(), reply_markup=_rules_button_markup())
+        await send_main_menu(message, _format_help())
+
+    @router.message(Command("menu"))
+    @_admin_only(settings)
+    async def menu_command(message: Message) -> None:
+        await send_main_menu(message)
 
     @router.message(Command("find_sources"))
     @_admin_only(settings)
@@ -1025,7 +1088,26 @@ def register_bot_handlers(
         user_id = _user_key(message)
         if user_id is not None:
             pending.pop(user_id, None)
-        await message.answer("Ожидающее действие очищено.")
+        await message.answer("Ожидающее действие очищено.", reply_markup=main_menu_reply_markup())
+
+    @router.message(Command("auto_sources_status"))
+    @_admin_only(settings)
+    async def auto_sources_status_command(message: Message) -> None:
+        last_run = state.auto_source_discovery_last_run.strftime("%Y-%m-%d %H:%M:%S UTC") if state.auto_source_discovery_last_run else "нет"
+        await message.answer(
+            "Автопоиск источников:\n"
+            f"enabled: {settings.auto_source_discovery_enabled}\n"
+            f"in_progress: {state.auto_source_discovery_in_progress}\n"
+            f"last_run: {last_run}\n"
+            f"last_report: {state.auto_source_discovery_last_report or 'нет'}"
+        )
+
+    @router.message(Command("auto_sources_run_now"))
+    @_admin_only(settings)
+    async def auto_sources_run_now_command(message: Message) -> None:
+        await message.answer("Запускаю автопоиск источников...")
+        report = await run_auto_source_discovery_once(settings, state, telethon_client, bot or message.bot)
+        await message.answer(report)
 
     @router.message(Command("rules"))
     @_admin_only(settings)
@@ -1164,6 +1246,34 @@ def register_bot_handlers(
 
         await message.answer(text, parse_mode="HTML")
 
+
+    @router.callback_query(lambda callback: callback.data == "main:status")
+    async def main_status_callback(callback: CallbackQuery) -> None:
+        if not is_admin_callback(callback, settings):
+            await callback.answer("Нет доступа.", show_alert=True)
+            return
+        if callback.message:
+            await callback.message.answer(state.status_text() + _crm_status_appendix(settings), reply_markup=main_menu_reply_markup())
+        await callback.answer()
+
+    @router.callback_query(lambda callback: callback.data == "main:health")
+    async def main_health_callback(callback: CallbackQuery) -> None:
+        if not is_admin_callback(callback, settings):
+            await callback.answer("Нет доступа.", show_alert=True)
+            return
+        if callback.message:
+            await callback.message.answer(_format_health(settings, state, telethon_client), parse_mode="HTML", reply_markup=main_menu_reply_markup())
+        await callback.answer()
+
+    @router.callback_query(lambda callback: callback.data == "main:pending_clear")
+    async def main_pending_clear_callback(callback: CallbackQuery) -> None:
+        if not is_admin_callback(callback, settings):
+            await callback.answer("Нет доступа.", show_alert=True)
+            return
+        pending.pop(callback.from_user.id, None)
+        if callback.message:
+            await callback.message.answer("Ожидающее действие очищено.", reply_markup=main_menu_reply_markup())
+        await callback.answer()
 
     @router.callback_query(lambda callback: callback.data == "crm:menu")
     async def crm_menu_callback(callback: CallbackQuery) -> None:
@@ -1394,7 +1504,8 @@ def register_bot_handlers(
             await callback.answer("Нет доступа.", show_alert=True)
             return
         if callback.message:
-            await callback.message.edit_text(_format_help(), reply_markup=_rules_button_markup())
+            await callback.message.answer(_format_help(), reply_markup=main_menu_reply_markup())
+            await callback.message.edit_text("Главное меню:", reply_markup=_rules_button_markup())
         await callback.answer()
 
     @router.callback_query(lambda callback: bool(callback.data and callback.data.startswith("rules:list:")))
@@ -1474,6 +1585,16 @@ def register_bot_handlers(
         await edit_rules_menu(callback)
         await callback.answer("Сохранено.")
 
+    @router.callback_query(lambda callback: callback.data == "rules:min_score")
+    async def rules_min_score_callback(callback: CallbackQuery) -> None:
+        if not is_admin_callback(callback, settings):
+            await callback.answer("Нет доступа.", show_alert=True)
+            return
+        pending[callback.from_user.id] = _pending_state(PENDING_RULE_MIN_SCORE, category="")
+        if callback.message:
+            await callback.message.answer("Отправьте новое число от -10 до 20")
+        await callback.answer()
+
     @router.callback_query(lambda callback: callback.data == "rules:min_length")
     async def rules_min_length_callback(callback: CallbackQuery) -> None:
         if not is_admin_callback(callback, settings):
@@ -1488,6 +1609,14 @@ def register_bot_handlers(
     async def pending_text(message: Message) -> None:
         user_id = _user_key(message)
         if user_id is None or user_id not in pending:
+            if is_main_menu_text(message.text):
+                if is_admin(message, settings):
+                    await send_main_menu(message)
+                else:
+                    await message.answer("Нет доступа.")
+                return
+            if is_admin(message, settings):
+                await send_main_menu(message, "Выберите действие в меню.")
             return
         if not is_admin(message, settings):
             pending.pop(user_id, None)
@@ -1588,6 +1717,22 @@ def register_bot_handlers(
                 else:
                     await message.answer(f"Не найдено: {value}")
             await answer_category(message, category)
+            return
+
+        elif action == PENDING_RULE_MIN_SCORE:
+            try:
+                number = int(value)
+            except ValueError:
+                await message.answer("Ошибка: отправьте число от -10 до 20.")
+                await send_rules_menu(message)
+                return
+            if not -10 <= number <= 20:
+                await message.answer("Ошибка: число должно быть от -10 до 20.")
+                await send_rules_menu(message)
+                return
+            state.rules = set_rule_value(settings.rules_file, "min_score", number, settings)
+            await message.answer(f"Минимальный скоринг сохранён: {number}")
+            await send_rules_menu(message)
             return
 
         elif action == PENDING_RULE_MIN_LENGTH:

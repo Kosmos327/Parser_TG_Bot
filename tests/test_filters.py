@@ -74,7 +74,7 @@ def test_should_process_message_exclude_keyword() -> None:
 def test_should_process_message_no_keyword() -> None:
     assert should_process_message("Нужна консультация по аренде офиса", "Налоги", _settings()) == (
         False,
-        "no_keyword",
+        "low_score",
     )
 
 
