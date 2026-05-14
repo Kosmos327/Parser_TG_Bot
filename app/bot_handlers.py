@@ -38,6 +38,15 @@ from app.state import ParserState
 SOURCE_JOIN_START_ALL = "source_join:start_all"
 SOURCE_JOIN_START_SELECTIVE = "source_join:start_selective"
 SOURCE_JOIN_CANCEL = "source_join:cancel"
+PENDING_SOURCE_SEARCH_WAIT_QUERIES = "source_search_wait_queries"
+PENDING_SOURCE_JOIN_CONFIRM = "source_join_confirm"
+PENDING_SOURCE_JOIN_SELECTIVE_WAIT_LIST = "source_join_selective_wait_list"
+PENDING_LEAD_COMMENT = "lead_comment"
+PENDING_LEAD_DATE = "lead_date"
+PENDING_LEAD_SEARCH = "lead_search"
+PENDING_RULE_ADD = "add"
+PENDING_RULE_REMOVE = "remove"
+PENDING_RULE_MIN_LENGTH = "min_length"
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +112,8 @@ def _format_help() -> str:
         "/source_candidates — найденные кандидаты\n"
         "/source_values — строка для SOURCE_CHATS\n"
         "/join_debug — диагностика подписки на источники\n"
+        "/pending_debug — показать текущее ожидающее действие\n"
+        "/pending_clear — очистить текущее ожидающее действие\n"
         "/config — безопасная конфигурация\n"
         "/health — состояние polling, Telethon и парсера\n"
         "/dialogs — показать чаты/каналы, доступные Telethon-сессии\n"
@@ -469,6 +480,29 @@ def _parse_source_queries(text: str) -> list[str]:
     return queries
 
 
+def _pending_state(action: str, **values: Any) -> PendingState:
+    return {"action": action, "timestamp": datetime.now(timezone.utc).isoformat(), **values}
+
+
+def _format_pending_debug(user_id: int | None, current: PendingState | None) -> str:
+    if not current:
+        return f"Pending debug for user_id={user_id or 'unknown'}:\npending: no"
+
+    keys = sorted(str(key) for key in current.keys())
+    source_values = current.get("source_values") or []
+    source_values_count = len(source_values) if isinstance(source_values, list) else 0
+    search_text = current.get("query") or current.get("text") or current.get("search") or ""
+    return (
+        f"Pending debug for user_id={user_id or 'unknown'}:\n"
+        "pending: yes\n"
+        f"action: {current.get('action') or 'нет'}\n"
+        f"keys: {', '.join(keys) if keys else 'нет'}\n"
+        f"source_values_count: {source_values_count}\n"
+        f"search_text: {search_text or 'нет'}\n"
+        f"timestamp: {current.get('timestamp') or 'нет'}"
+    )
+
+
 def _candidate_username(candidate: dict[str, Any]) -> str | None:
     value = candidate.get("username") or candidate.get("source_chats_value")
     if not value:
@@ -754,17 +788,24 @@ def register_bot_handlers(
             disable_web_page_preview=True,
         )
 
-    async def start_find_sources(message: Message) -> None:
-        if telethon_client is None or not _is_telethon_connected(telethon_client):
-            await message.answer("Telethon client недоступен или не подключён. Проверьте /health.")
-            return
-        user_id = _user_key(message)
+    async def start_find_sources(message: Message, user_id: int | None = None) -> None:
+        if user_id is None:
+            user_id = _user_key(message)
         if user_id is not None:
-            pending[user_id] = {"action": "find_sources_queries", "category": ""}
+            pending[user_id] = _pending_state(PENDING_SOURCE_SEARCH_WAIT_QUERIES)
+            logger.info(
+                "source search pending set: user_id=%s, action=%s",
+                user_id,
+                PENDING_SOURCE_SEARCH_WAIT_QUERIES,
+            )
         await message.answer(_find_sources_prompt())
 
     async def run_source_search(message: Message, queries: list[str]) -> None:
         await message.answer(f"Ищу источники по {len(queries)} запросам. Лимит: {settings.source_search_limit} на запрос.")
+        if telethon_client is None or not _is_telethon_connected(telethon_client):
+            await message.answer("Telethon client недоступен или не подключён. Проверьте /health и перезапустите бот при необходимости.")
+            return
+
         try:
             found = await search_sources(telethon_client, queries, settings.source_search_limit)
             existing = load_candidates(settings.source_candidates_file)
@@ -773,14 +814,28 @@ def register_bot_handlers(
             export_path = export_candidates_txt(merged, settings.source_export_file)
         except Exception as exc:
             state.last_error = str(exc)
-            await message.answer(f"Не удалось найти источники: {escape(str(exc))}", parse_mode="HTML")
+            logger.exception("source search flow failed")
+            await message.answer(f"Ошибка при поиске источников: {escape(str(exc))}", parse_mode="HTML")
             return
 
-        public_count = len([candidate for candidate in merged if _candidate_username(candidate)])
+        found_public_count = len([candidate for candidate in found if _candidate_username(candidate)])
+        logger.info(
+            "source search completed queries_count=%s candidates_count=%s public_username_count=%s",
+            len(queries),
+            len(found),
+            found_public_count,
+        )
+        if not found:
+            await message.answer(
+                "По этим словам источники не найдены. Можно попробовать другие слова.",
+                reply_markup=_continue_search_markup(),
+            )
+            return
+
         if Path(export_path).exists() and Path(export_path).stat().st_size > 0:
             await message.answer_document(FSInputFile(export_path, filename="source_candidates.txt"))
         await message.answer(
-            f"Нашёл {public_count} источников с публичным username. Файл приложен.\nПродолжить поиск?",
+            f"Нашёл {found_public_count} источников с публичным username. Файл приложен.\nПродолжить поиск?",
             reply_markup=_continue_search_markup(),
         )
 
@@ -801,7 +856,7 @@ def register_bot_handlers(
         if user_id is None:
             user_id = _user_key(message)
         if user_id is not None:
-            pending[user_id] = {"action": "source_join_confirm", "source_values": source_values, "mode": "all"}
+            pending[user_id] = _pending_state(PENDING_SOURCE_JOIN_CONFIRM, source_values=source_values, mode="all")
         text, markup = _prepare_join_confirmation(source_values, settings, "all")
         await message.answer(text, reply_markup=markup)
 
@@ -809,7 +864,7 @@ def register_bot_handlers(
         if user_id is None:
             user_id = _user_key(message)
         if user_id is not None:
-            pending[user_id] = {"action": "source_join_selective_wait_list"}
+            pending[user_id] = _pending_state(PENDING_SOURCE_JOIN_SELECTIVE_WAIT_LIST)
         await message.answer(
             "Пришлите список каналов, на которые нужно подписаться. Можно столбиком:\n"
             "@channel1\n@channel2\nhttps://t.me/channel3"
@@ -957,6 +1012,21 @@ def register_bot_handlers(
             parse_mode="HTML",
         )
 
+    @router.message(Command("pending_debug"))
+    @_admin_only(settings)
+    async def pending_debug_command(message: Message) -> None:
+        user_id = _user_key(message)
+        current = pending.get(user_id) if user_id is not None else None
+        await message.answer(_format_pending_debug(user_id, current))
+
+    @router.message(Command("pending_clear"))
+    @_admin_only(settings)
+    async def pending_clear_command(message: Message) -> None:
+        user_id = _user_key(message)
+        if user_id is not None:
+            pending.pop(user_id, None)
+        await message.answer("Ожидающее действие очищено.")
+
     @router.message(Command("rules"))
     @_admin_only(settings)
     async def rules_command(message: Message) -> None:
@@ -1002,7 +1072,7 @@ def register_bot_handlers(
     @_admin_only(settings)
     async def lead_search_command(message: Message) -> None:
         if message.from_user:
-            pending[message.from_user.id] = {"action": "lead_search", "category": ""}
+            pending[message.from_user.id] = _pending_state(PENDING_LEAD_SEARCH, category="")
         await message.answer(
             "Введите текст для поиска по лидам. Можно искать по логину, имени, ID, источнику, тексту сообщения или комментарию."
         )
@@ -1139,7 +1209,7 @@ def register_bot_handlers(
         if not is_admin_callback(callback, settings):
             await callback.answer("Нет доступа.", show_alert=True)
             return
-        pending[callback.from_user.id] = {"action": "lead_search", "category": ""}
+        pending[callback.from_user.id] = _pending_state(PENDING_LEAD_SEARCH, category="")
         if callback.message:
             await callback.message.answer(
                 "Введите текст для поиска по лидам. Можно искать по логину, имени, ID, источнику, тексту сообщения или комментарию."
@@ -1200,13 +1270,13 @@ def register_bot_handlers(
             await callback.answer("Лид отмечен нецелевым")
             return
         if action == "comment":
-            pending[callback.from_user.id] = {"action": "lead_comment", "category": "", "lead_key": lead_key}
+            pending[callback.from_user.id] = _pending_state(PENDING_LEAD_COMMENT, category="", lead_key=lead_key)
             if callback.message:
                 await callback.message.answer("Напишите комментарий к заявке")
             await callback.answer()
             return
         if action == "date":
-            pending[callback.from_user.id] = {"action": "lead_date", "category": "", "lead_key": lead_key}
+            pending[callback.from_user.id] = _pending_state(PENDING_LEAD_DATE, category="", lead_key=lead_key)
             if callback.message:
                 await callback.message.answer("Отправьте дату обработки в формате ДД.ММ.ГГГГ")
             await callback.answer()
@@ -1223,7 +1293,7 @@ def register_bot_handlers(
             await callback.answer("Нет доступа.", show_alert=True)
             return
         if callback.message:
-            await start_find_sources(callback.message)
+            await start_find_sources(callback.message, callback.from_user.id)
         await callback.answer()
 
     @router.callback_query(lambda callback: callback.data == "sources:continue")
@@ -1232,7 +1302,7 @@ def register_bot_handlers(
             await callback.answer("Нет доступа.", show_alert=True)
             return
         if callback.message:
-            await start_find_sources(callback.message)
+            await start_find_sources(callback.message, callback.from_user.id)
         await callback.answer()
 
     @router.callback_query(lambda callback: callback.data == "sources:subscribe_step")
@@ -1348,7 +1418,7 @@ def register_bot_handlers(
         if category not in LIST_FIELDS or not callback.message:
             await callback.answer("Неизвестная категория.", show_alert=True)
             return
-        pending[callback.from_user.id] = {"action": "add", "category": category}
+        pending[callback.from_user.id] = _pending_state(PENDING_RULE_ADD, category=category)
         await callback.message.answer(f"Отправьте новое значение для категории: {CATEGORY_TITLES[category]}")
         await callback.answer()
 
@@ -1361,7 +1431,7 @@ def register_bot_handlers(
         if category not in LIST_FIELDS or not callback.message:
             await callback.answer("Неизвестная категория.", show_alert=True)
             return
-        pending[callback.from_user.id] = {"action": "remove", "category": category}
+        pending[callback.from_user.id] = _pending_state(PENDING_RULE_REMOVE, category=category)
         await callback.message.answer("Отправьте точное значение, которое нужно удалить")
         await callback.answer()
 
@@ -1409,7 +1479,7 @@ def register_bot_handlers(
         if not is_admin_callback(callback, settings):
             await callback.answer("Нет доступа.", show_alert=True)
             return
-        pending[callback.from_user.id] = {"action": "min_length", "category": ""}
+        pending[callback.from_user.id] = _pending_state(PENDING_RULE_MIN_LENGTH, category="")
         if callback.message:
             await callback.message.answer("Отправьте новое число от 1 до 1000")
         await callback.answer()
@@ -1425,11 +1495,11 @@ def register_bot_handlers(
             return
 
         current = pending.pop(user_id)
-        action = current["action"]
+        action = current.get("action")
         category = current.get("category", "")
         value = (message.text or "").strip()
 
-        if action == "lead_comment":
+        if action == PENDING_LEAD_COMMENT:
             lead_key = current.get("lead_key", "")
             lead = get_lead_by_key(settings.leads_file, lead_key)
             if not lead:
@@ -1440,7 +1510,7 @@ def register_bot_handlers(
             await show_lead_card(message, lead_key)
             return
 
-        if action == "lead_date":
+        elif action == PENDING_LEAD_DATE:
             lead_key = current.get("lead_key", "")
             lead = get_lead_by_key(settings.leads_file, lead_key)
             if not lead:
@@ -1456,7 +1526,7 @@ def register_bot_handlers(
             await show_lead_card(message, lead_key)
             return
 
-        if action == "lead_search":
+        elif action == PENDING_LEAD_SEARCH:
             if not value:
                 await message.answer("Пустой поисковый запрос не выполнен.")
                 return
@@ -1465,16 +1535,16 @@ def register_bot_handlers(
             await show_search_results_message(message, search_id, value, 1)
             return
 
-        if action == "find_sources_queries":
-            queries = _parse_source_queries(value)
+        elif action == PENDING_SOURCE_SEARCH_WAIT_QUERIES:
+            queries = _parse_source_queries(message.text or "")
             if not queries:
-                await message.answer("Не получил ни одного запроса. Отправьте слова/фразы строками.")
-                await start_find_sources(message)
+                pending[user_id] = current
+                await message.answer("Не нашёл слов для поиска. Отправьте одно или несколько слов/фраз.")
                 return
             await run_source_search(message, queries)
             return
 
-        if action == "source_join_selective_wait_list":
+        elif action == PENDING_SOURCE_JOIN_SELECTIVE_WAIT_LIST:
             line_count = len([line for line in (message.text or "").splitlines() if line.strip()])
             sources = _normalize_source_values_for_join(parse_sources_text(value))
             logger.info("source selective text received lines=%s parsed=%s", line_count, len(sources))
@@ -1486,18 +1556,14 @@ def register_bot_handlers(
             if len(sources) > 100:
                 sources = sources[:100]
                 warning = "\nСписок был больше 100 источников, взял первые 100."
-            pending[user_id] = {
-                "action": "source_join_confirm",
-                "source_values": sources,
-                "mode": "selective",
-            }
+            pending[user_id] = _pending_state(PENDING_SOURCE_JOIN_CONFIRM, source_values=sources, mode="selective")
             text, markup = _prepare_join_confirmation(sources, settings, "selective")
             if warning:
                 text = text.replace("\nПодписаться безопасной партией?", f"{warning}\nПодписаться безопасной партией?", 1)
             await message.answer(text, reply_markup=markup)
             return
 
-        if action in {"add", "remove"}:
+        elif action in {PENDING_RULE_ADD, PENDING_RULE_REMOVE}:
             if not value:
                 await message.answer("Пустое значение не сохранено.")
                 await answer_category(message, category)
@@ -1507,7 +1573,7 @@ def register_bot_handlers(
                 await answer_category(message, category)
                 return
 
-            if action == "add":
+            if action == PENDING_RULE_ADD:
                 before = {item.casefold() for item in getattr(state.rules, category)}
                 state.rules = add_rule_item(settings.rules_file, category, value, settings)
                 if value.casefold() in before:
@@ -1524,7 +1590,7 @@ def register_bot_handlers(
             await answer_category(message, category)
             return
 
-        if action == "min_length":
+        elif action == PENDING_RULE_MIN_LENGTH:
             try:
                 number = int(value)
             except ValueError:
@@ -1538,5 +1604,9 @@ def register_bot_handlers(
             state.rules = set_rule_value(settings.rules_file, "min_message_length", number, settings)
             await message.answer(f"Мин. длина сообщения сохранена: {number}")
             await send_rules_menu(message)
+            return
+
+        logger.warning("unknown pending action: user_id=%s action=%s keys=%s", user_id, action, sorted(current.keys()))
+        await message.answer("Не понял ожидаемое действие. Попробуйте начать заново.")
 
     dispatcher.include_router(router)
