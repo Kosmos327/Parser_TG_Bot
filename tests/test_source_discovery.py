@@ -47,3 +47,28 @@ def test_parse_sources_text_deduplicates_case_insensitively() -> None:
     """
 
     assert parse_sources_text(text) == ["@channel4"]
+
+
+def test_parse_sources_text_accepts_line_list() -> None:
+    text = "@buhcumIter\n@secrets_1C\n@bs_accounting\n@anna_kvorss\n@hacks_1c\n@bukhgalteriaa\n@bukhgalteria1\n@bukhgalteria1C\n"
+
+    assert parse_sources_text(text) == [
+        "@buhcumIter",
+        "@secrets_1C",
+        "@bs_accounting",
+        "@anna_kvorss",
+        "@hacks_1c",
+        "@bukhgalteriaa",
+        "@bukhgalteria1",
+        "@bukhgalteria1C",
+    ]
+
+
+def test_filter_joinable_candidates_accepts_public_source_chats_value() -> None:
+    candidates = [
+        {"username": None, "source_chats_value": "@source_value", "joined": False, "skipped": False, "manual_required": False, "error": None},
+        {"username": None, "source_chats_value": "-100123", "joined": False, "skipped": False, "manual_required": False, "error": None},
+    ]
+
+    assert filter_joinable_candidates(candidates) == [candidates[0]]
+    assert filter_joinable_candidates(candidates)[0]["source_chats_value"] == "@source_value"
