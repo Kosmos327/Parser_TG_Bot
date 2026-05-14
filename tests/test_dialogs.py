@@ -54,3 +54,23 @@ def test_bot_format_escapes_html_and_hides_access_hash() -> None:
     assert "&lt;Business&gt;" in formatted
     assert "SOURCE_CHATS: -1001234567890" in formatted
     assert "987654321" not in formatted
+
+from app.dialogs import is_source_dialog_allowed
+
+
+def test_private_user_excluded_when_enabled() -> None:
+    entity = SimpleNamespace(first_name="Ivan", last_name="User", username="ivan", id=42)
+
+    assert is_source_dialog_allowed(entity, exclude_private_chats=True) is False
+
+
+def test_private_user_allowed_when_disabled() -> None:
+    entity = SimpleNamespace(first_name="Ivan", last_name="User", username="ivan", id=42)
+
+    assert is_source_dialog_allowed(entity, exclude_private_chats=False) is True
+
+
+def test_channel_allowed_when_private_exclusion_enabled() -> None:
+    entity = SimpleNamespace(title="Public Channel", username="channel", id=-1001)
+
+    assert is_source_dialog_allowed(entity, exclude_private_chats=True) is True

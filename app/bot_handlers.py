@@ -1,20 +1,33 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
+from pathlib import Path
 from functools import wraps
 from html import escape
 from typing import Any
 
 from aiogram import Dispatcher, Router
 from aiogram.filters import Command
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from telethon import utils
 
-from app.config import Settings
-from app.dialogs import dialog_info_from_entity, format_dialog_bot_item
+from app.config import Settings, risky_settings_warnings
+from app.dialogs import dialog_info_from_entity, format_dialog_bot_item, is_source_dialog_allowed
 from app.leads_storage import count_leads, get_last_leads
 from app.models import LeadEvent
 from app.rules_storage import LIST_FIELDS, add_rule_item, remove_rule_item, save_rules, set_rule_value
+from app.source_discovery import (
+    export_candidates_txt,
+    filter_joinable_candidates,
+    load_candidates,
+    mark_candidate_status,
+    merge_candidates,
+    parse_sources_text,
+    save_candidates,
+    search_sources,
+)
+from app.source_joiner import join_sources_limited
 from app.state import ParserState
 
 CATEGORY_TITLES = {
@@ -25,7 +38,7 @@ CATEGORY_TITLES = {
 }
 
 
-PendingState = dict[str, str]
+PendingState = dict[str, Any]
 
 
 def is_admin(message: Message, settings: Settings) -> bool:
@@ -49,7 +62,10 @@ def is_admin_callback(callback: CallbackQuery, settings: Settings) -> bool:
 
 def _rules_button_markup() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="⚙️ Правила парсинга", callback_data="rules:menu")]]
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔎 Найти новые источники", callback_data="sources:find")],
+            [InlineKeyboardButton(text="⚙️ Правила парсинга", callback_data="rules:menu")],
+        ]
     )
 
 
@@ -66,6 +82,10 @@ def _format_help() -> str:
         "/keywords — текущие слова-триггеры\n"
         "/sources — текущие источники\n"
         "/rules — открыть правила парсинга\n"
+        "🔎 Найти новые источники\n"
+        "/find_sources — поиск новых источников\n"
+        "/source_candidates — найденные кандидаты\n"
+        "/source_values — строка для SOURCE_CHATS\n"
         "/config — безопасная конфигурация\n"
         "/health — состояние polling, Telethon и парсера\n"
         "/dialogs — показать чаты/каналы, доступные Telethon-сессии\n"
@@ -172,7 +192,17 @@ def _format_safe_config(settings: Settings, state: ParserState) -> str:
         f"leads_file: {escape(settings.leads_file)}",
         f"dedup_file: {escape(settings.dedup_file)}",
         f"log_level: {escape(settings.log_level)}",
+        f"source_search_limit: {settings.source_search_limit}",
+        f"join_batch_limit: {settings.join_batch_limit}",
+        f"join_delay_seconds: {settings.join_delay_seconds}",
+        f"exclude_private_chats: {_format_bool(settings.exclude_private_chats)}",
+        f"source_candidates_file: {escape(settings.source_candidates_file)}",
+        f"source_export_file: {escape(settings.source_export_file)}",
     ]
+    warnings = risky_settings_warnings(settings)
+    if warnings:
+        parts.append("<b>Предупреждения безопасности</b>")
+        parts.extend(f"⚠️ {escape(warning)}" for warning in warnings)
     return "\n".join(parts)
 
 
@@ -265,15 +295,18 @@ def _is_telethon_connected(client: Any | None) -> bool:
         return False
 
 
-async def _format_available_dialogs(client: Any, limit: int = 20, max_length: int = 3800) -> str:
+async def _format_available_dialogs(client: Any, exclude_private_chats: bool = True, limit: int = 20, max_length: int = 3800) -> str:
     parts = ["<b>📡 Доступные источники</b>"]
     count = 0
     has_more = False
 
-    async for dialog in client.iter_dialogs(limit=limit + 1):
+    async for dialog in client.iter_dialogs(limit=(limit * 5) + 1):
         if count >= limit:
             has_more = True
             break
+
+        if not is_source_dialog_allowed(dialog, exclude_private_chats):
+            continue
 
         entity = dialog.entity
         info = dialog_info_from_entity(entity, peer_id=utils.get_peer_id(entity))
@@ -319,13 +352,100 @@ def _format_health(settings: Settings, state: ParserState, client: Any | None) -
         f"Last error: {escape(state.last_error or 'нет')}\n"
         f"Uptime: {_format_uptime(state.started_at)}\n"
         f"Processed count: {state.processed_count}\n"
-        f"Matched count: {state.matched_count}"
+        f"Matched count: {state.matched_count}\n"
+        f"Source join: {'in progress' if state.source_join_in_progress else 'idle'}\n"
+        f"Source join last report: {escape(state.source_join_last_report or 'нет')}"
     )
 
 
 def _user_key(message: Message) -> int | None:
     return message.from_user.id if message.from_user else None
 
+
+
+def _find_sources_prompt() -> str:
+    return (
+        "Напишите слова/фразы, по которым нужно искать каналы. Можно несколько строк, например:\n"
+        "налоги\n"
+        "бухгалтерия\n"
+        "ип"
+    )
+
+
+def _subscription_choice_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Подписаться на все найденные", callback_data="sources:join_all")],
+            [InlineKeyboardButton(text="✍️ Выборочно", callback_data="sources:join_selective")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="sources:cancel")],
+        ]
+    )
+
+
+def _continue_search_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Да, продолжить поиск", callback_data="sources:continue")],
+            [InlineKeyboardButton(text="❌ Нет, перейти к подписке", callback_data="sources:subscribe_step")],
+        ]
+    )
+
+
+def _confirm_join_markup(mode: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Начать подписку", callback_data=f"sources:confirm_join:{mode}")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="sources:cancel")],
+        ]
+    )
+
+
+def _parse_source_queries(text: str) -> list[str]:
+    queries: list[str] = []
+    for line in text.splitlines():
+        query = line.strip()
+        if not query:
+            continue
+        if len(query) > 100:
+            query = query[:100].strip()
+        queries.append(query)
+        if len(queries) >= 10:
+            break
+    return queries
+
+
+def _candidate_username(candidate: dict[str, Any]) -> str | None:
+    value = candidate.get("username") or candidate.get("source_chats_value")
+    if not value:
+        return None
+    username = str(value).strip()
+    if username.startswith("@"):
+        return username
+    if username and not username.lstrip("-").isdigit():
+        return f"@{username}"
+    return None
+
+
+def _format_join_report(result: dict[str, Any]) -> str:
+    return (
+        "Отчёт подписки:\n"
+        f"- подписался: {len(result['joined'])}\n"
+        f"- уже был подписан: {len(result['already_joined'])}\n"
+        f"- требуют ручного действия/капчи: {len(result['manual_required'])}\n"
+        f"- ошибки: {len(result['failed'])}\n"
+        + (
+            f"- остановлено из-за FloodWait: {result['floodwait_seconds']} секунд\n"
+            if result.get("stopped_by_floodwait")
+            else ""
+        )
+    ).strip()
+
+
+def _write_sources_txt(path: str, values: list[str]) -> str:
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text("\n".join(values) + ("\n" if values else ""), encoding="utf-8")
+    return str(output_path)
 
 def register_bot_handlers(
     dispatcher: Dispatcher,
@@ -348,6 +468,125 @@ def register_bot_handlers(
     async def answer_category(message: Message, category: str) -> None:
         await message.answer(_format_category(category, state), reply_markup=_category_markup(category), parse_mode="HTML")
 
+    async def start_find_sources(message: Message) -> None:
+        if telethon_client is None or not _is_telethon_connected(telethon_client):
+            await message.answer("Telethon client недоступен или не подключён. Проверьте /health.")
+            return
+        user_id = _user_key(message)
+        if user_id is not None:
+            pending[user_id] = {"action": "find_sources_queries", "category": ""}
+        await message.answer(_find_sources_prompt())
+
+    async def run_source_search(message: Message, queries: list[str]) -> None:
+        await message.answer(f"Ищу источники по {len(queries)} запросам. Лимит: {settings.source_search_limit} на запрос.")
+        try:
+            found = await search_sources(telethon_client, queries, settings.source_search_limit)
+            existing = load_candidates(settings.source_candidates_file)
+            merged = merge_candidates(existing, found)
+            save_candidates(merged, settings.source_candidates_file)
+            export_path = export_candidates_txt(merged, settings.source_export_file)
+        except Exception as exc:
+            state.last_error = str(exc)
+            await message.answer(f"Не удалось найти источники: {escape(str(exc))}", parse_mode="HTML")
+            return
+
+        public_count = len([candidate for candidate in merged if _candidate_username(candidate)])
+        if Path(export_path).exists() and Path(export_path).stat().st_size > 0:
+            await message.answer_document(FSInputFile(export_path, filename="source_candidates.txt"))
+        await message.answer(
+            f"Нашёл {public_count} источников с публичным username. Файл приложен.\nПродолжить поиск?",
+            reply_markup=_continue_search_markup(),
+        )
+
+    async def ask_subscription_choice(message: Message) -> None:
+        await message.answer("Подписаться на найденные источники?", reply_markup=_subscription_choice_markup())
+
+    async def prepare_join_all(message: Message) -> None:
+        candidates = filter_joinable_candidates(load_candidates(settings.source_candidates_file))
+        sources = [username for candidate in candidates if (username := _candidate_username(candidate))]
+        if not sources:
+            await message.answer("Нет найденных username-источников, доступных для автоматической подписки.")
+            return
+        user_id = _user_key(message)
+        if user_id is not None:
+            pending[user_id] = {"action": "confirm_join_all", "category": "", "sources": sources}
+        await message.answer(
+            "Буду подписываться безопасной партией: "
+            f"максимум {settings.join_batch_limit} источников, задержка {settings.join_delay_seconds} секунд. "
+            "Это может занять время. Массовые подписки могут привести к ограничениям Telegram.",
+            reply_markup=_confirm_join_markup("all"),
+        )
+
+    async def prepare_selective_join(message: Message) -> None:
+        user_id = _user_key(message)
+        if user_id is not None:
+            pending[user_id] = {"action": "selective_sources", "category": ""}
+        await message.answer(
+            "Пришлите список каналов, на которые нужно подписаться. Можно столбиком:\n"
+            "@channel1\n@channel2\nhttps://t.me/channel3"
+        )
+
+    async def run_join_background(bot_obj: Any, chat_id: int, sources: list[str]) -> None:
+        if state.source_join_in_progress:
+            await bot_obj.send_message(chat_id, "Подписка уже выполняется. Дождитесь завершения.")
+            return
+        state.source_join_in_progress = True
+        state.source_join_started_at = datetime.now(timezone.utc)
+        state.source_join_last_report = "запущена"
+        attempted = 0
+
+        async def progress(source: str, status: str) -> None:
+            nonlocal attempted
+            attempted += 1
+            mark_candidate_status(
+                settings.source_candidates_file,
+                source,
+                "joined" if status in {"joined", "already_joined"} else ("manual_required" if status == "manual_required" else "failed"),
+                None if status in {"joined", "already_joined"} else status,
+            )
+            if attempted % 5 == 0:
+                state.source_join_last_report = f"обработано {attempted}: {source} — {status}"
+                await bot_obj.send_message(chat_id, state.source_join_last_report)
+
+        try:
+            result = await join_sources_limited(
+                telethon_client,
+                sources,
+                delay_seconds=settings.join_delay_seconds,
+                max_join=settings.join_batch_limit,
+                status_callback=progress,
+            )
+            report = _format_join_report(result)
+            state.source_join_last_report = report
+            await bot_obj.send_message(chat_id, report)
+            manual_sources = [item["source"] for item in result["manual_required"] if isinstance(item, dict) and item.get("source")]
+            if manual_sources:
+                manual_path = _write_sources_txt("data/manual_required_sources.txt", manual_sources)
+                await bot_obj.send_document(
+                    chat_id,
+                    FSInputFile(manual_path, filename="manual_required_sources.txt"),
+                    caption=(
+                        "На эти источники не удалось подписаться автоматически. Возможно, там капча, "
+                        "заявка на вступление или ограничение. Подпишитесь и пройдите проверку вручную."
+                    ),
+                )
+        except Exception as exc:
+            state.last_error = str(exc)
+            state.source_join_last_report = f"ошибка: {exc}"
+            await bot_obj.send_message(chat_id, f"Ошибка подписки: {escape(str(exc))}", parse_mode="HTML")
+        finally:
+            state.source_join_in_progress = False
+
+    async def confirm_join(message: Message, sources: list[str]) -> None:
+        if state.source_join_in_progress:
+            await message.answer("Подписка уже выполняется. Дождитесь завершения.")
+            return
+        await message.answer(
+            "Начинаю подписку в фоне. /status и /health продолжат отвечать. "
+            "При FloodWait процесс будет остановлен без обхода ограничений."
+        )
+        asyncio.create_task(run_join_background(message.bot, message.chat.id, sources), name="source-join")
+
     @router.message(Command("start"))
     @_admin_only(settings)
     async def start(message: Message) -> None:
@@ -357,6 +596,34 @@ def register_bot_handlers(
     @_admin_only(settings)
     async def help_command(message: Message) -> None:
         await message.answer(_format_help(), reply_markup=_rules_button_markup())
+
+    @router.message(Command("find_sources"))
+    @_admin_only(settings)
+    async def find_sources_command(message: Message) -> None:
+        await start_find_sources(message)
+
+    @router.message(Command("source_candidates"))
+    @_admin_only(settings)
+    async def source_candidates_command(message: Message) -> None:
+        candidates = load_candidates(settings.source_candidates_file)
+        public_count = len([candidate for candidate in candidates if _candidate_username(candidate)])
+        if not candidates:
+            await message.answer("Кандидаты ещё не найдены. Запустите /find_sources.")
+            return
+        export_path = export_candidates_txt(candidates, settings.source_export_file)
+        if Path(export_path).exists() and Path(export_path).stat().st_size > 0:
+            await message.answer_document(FSInputFile(export_path, filename="source_candidates.txt"))
+        await message.answer(f"Всего кандидатов: {len(candidates)}. С публичным username: {public_count}.")
+
+    @router.message(Command("source_values"))
+    @_admin_only(settings)
+    async def source_values_command(message: Message) -> None:
+        candidates = load_candidates(settings.source_candidates_file)
+        values = [username for candidate in candidates if (username := _candidate_username(candidate))]
+        if not values:
+            await message.answer("Нет найденных публичных username для SOURCE_CHATS.")
+            return
+        await message.answer("SOURCE_CHATS=" + ",".join(values[:100]))
 
     @router.message(Command("rules"))
     @_admin_only(settings)
@@ -443,12 +710,80 @@ def register_bot_handlers(
             return
 
         try:
-            text = await _format_available_dialogs(telethon_client)
+            text = await _format_available_dialogs(telethon_client, settings.exclude_private_chats)
         except Exception as exc:
             await message.answer(f"Не удалось получить список диалогов Telethon: {escape(str(exc))}", parse_mode="HTML")
             return
 
         await message.answer(text, parse_mode="HTML")
+
+    @router.callback_query(lambda callback: callback.data == "sources:find")
+    async def find_sources_callback(callback: CallbackQuery) -> None:
+        if not is_admin_callback(callback, settings):
+            await callback.answer("Нет доступа.", show_alert=True)
+            return
+        if callback.message:
+            await start_find_sources(callback.message)
+        await callback.answer()
+
+    @router.callback_query(lambda callback: callback.data == "sources:continue")
+    async def continue_sources_callback(callback: CallbackQuery) -> None:
+        if not is_admin_callback(callback, settings):
+            await callback.answer("Нет доступа.", show_alert=True)
+            return
+        if callback.message:
+            await start_find_sources(callback.message)
+        await callback.answer()
+
+    @router.callback_query(lambda callback: callback.data == "sources:subscribe_step")
+    async def subscribe_step_callback(callback: CallbackQuery) -> None:
+        if not is_admin_callback(callback, settings):
+            await callback.answer("Нет доступа.", show_alert=True)
+            return
+        if callback.message:
+            await ask_subscription_choice(callback.message)
+        await callback.answer()
+
+    @router.callback_query(lambda callback: callback.data == "sources:join_all")
+    async def join_all_callback(callback: CallbackQuery) -> None:
+        if not is_admin_callback(callback, settings):
+            await callback.answer("Нет доступа.", show_alert=True)
+            return
+        if callback.message:
+            await prepare_join_all(callback.message)
+        await callback.answer()
+
+    @router.callback_query(lambda callback: callback.data == "sources:join_selective")
+    async def join_selective_callback(callback: CallbackQuery) -> None:
+        if not is_admin_callback(callback, settings):
+            await callback.answer("Нет доступа.", show_alert=True)
+            return
+        if callback.message:
+            await prepare_selective_join(callback.message)
+        await callback.answer()
+
+    @router.callback_query(lambda callback: callback.data == "sources:cancel")
+    async def sources_cancel_callback(callback: CallbackQuery) -> None:
+        if not is_admin_callback(callback, settings):
+            await callback.answer("Нет доступа.", show_alert=True)
+            return
+        pending.pop(callback.from_user.id, None)
+        if callback.message:
+            await callback.message.answer("Сценарий источников отменён.")
+        await callback.answer()
+
+    @router.callback_query(lambda callback: bool(callback.data and callback.data.startswith("sources:confirm_join:")))
+    async def confirm_join_callback(callback: CallbackQuery) -> None:
+        if not is_admin_callback(callback, settings):
+            await callback.answer("Нет доступа.", show_alert=True)
+            return
+        current = pending.pop(callback.from_user.id, {})
+        sources = current.get("sources", [])
+        if not sources or not callback.message:
+            await callback.answer("Нет списка источников для подписки.", show_alert=True)
+            return
+        await confirm_join(callback.message, list(sources))
+        await callback.answer()
 
     @router.callback_query(lambda callback: callback.data == "rules:menu")
     async def rules_menu_callback(callback: CallbackQuery) -> None:
@@ -568,6 +903,33 @@ def register_bot_handlers(
         action = current["action"]
         category = current.get("category", "")
         value = (message.text or "").strip()
+
+        if action == "find_sources_queries":
+            queries = _parse_source_queries(value)
+            if not queries:
+                await message.answer("Не получил ни одного запроса. Отправьте слова/фразы строками.")
+                await start_find_sources(message)
+                return
+            await run_source_search(message, queries)
+            return
+
+        if action == "selective_sources":
+            sources = parse_sources_text(value)
+            if not sources:
+                await message.answer("Не получил ни одного публичного @username или t.me-ссылки.")
+                return
+            warning = ""
+            if len(sources) > 100:
+                sources = sources[:100]
+                warning = "\nСписок был больше 100 источников, взял первые 100."
+            pending[user_id] = {"action": "confirm_join_selective", "category": "", "sources": sources}
+            await message.answer(
+                f"Принял {len(sources)} источников.{warning}\n"
+                f"Подписаться безопасной партией: максимум {settings.join_batch_limit}, "
+                f"задержка {settings.join_delay_seconds} секунд?",
+                reply_markup=_confirm_join_markup("selective"),
+            )
+            return
 
         if action in {"add", "remove"}:
             if not value:

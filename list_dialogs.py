@@ -7,7 +7,7 @@ from pathlib import Path
 from telethon import TelegramClient, errors, utils
 
 from app.config import load_settings
-from app.dialogs import dialog_info_from_entity, format_dialog_cli_item
+from app.dialogs import dialog_info_from_entity, format_dialog_cli_item, is_source_dialog_allowed
 
 DEFAULT_LIMIT = 200
 
@@ -54,6 +54,8 @@ async def main() -> int:
         print(f"Первые {args.limit} диалогов, доступных текущей Telethon user session:\n")
         printed = 0
         async for dialog in client.iter_dialogs(limit=args.limit):
+            if not is_source_dialog_allowed(dialog, settings.exclude_private_chats):
+                continue
             entity = dialog.entity
             info = dialog_info_from_entity(entity, peer_id=utils.get_peer_id(entity))
             print(format_dialog_cli_item(info, printed + 1))

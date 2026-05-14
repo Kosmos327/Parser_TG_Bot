@@ -9,7 +9,8 @@ from aiogram import Bot, Dispatcher
 from telethon import TelegramClient, events
 
 from app.bot_handlers import register_bot_handlers
-from app.config import Settings, load_settings
+from app.config import Settings, load_settings, risky_settings_warnings
+from app.dialogs import is_source_dialog_allowed
 from app.filters import should_process_message
 from app.leads_storage import append_lead
 from app.models import LeadEvent
@@ -88,6 +89,8 @@ async def run() -> None:
     state = ParserState(enabled=settings.parser_enabled, rules=rules)
     processed = load_processed(settings.dedup_file)
     logger.info("Loaded %s processed message keys.", len(processed))
+    for warning in risky_settings_warnings(settings):
+        logger.warning(warning)
 
     client = TelegramClient(settings.session_name, settings.api_id, settings.api_hash)
     bot = Bot(token=settings.bot_token)
@@ -103,6 +106,10 @@ async def run() -> None:
             chat = await event.get_chat()
             sender = await event.get_sender()
             source_title = _source_title(chat, source_id)
+
+            if not is_source_dialog_allowed(chat, settings.exclude_private_chats):
+                logger.debug("Skipping message %s: private user dialog is excluded.", message_id)
+                return
 
             if not state.enabled:
                 logger.debug("Parser is paused. Skipping message %s.", message_id)
