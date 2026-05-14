@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from hashlib import sha1
 
@@ -12,6 +12,15 @@ def _lead_id_for(source_id: int | None, message_id: int) -> str:
 
 def _lead_key_for(lead_id: str) -> str:
     return sha1(lead_id.encode("utf-8")).hexdigest()[:12]
+
+
+@dataclass(frozen=True)
+class LeadMatchResult:
+    matched: bool
+    score: int
+    matched_phrases: list[str] = field(default_factory=list)
+    negative_phrases: list[str] = field(default_factory=list)
+    reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -27,6 +36,9 @@ class LeadEvent:
     matched_at: datetime
     lead_id: str = ""
     lead_key: str = ""
+    score: int | None = None
+    matched_phrases: list[str] = field(default_factory=list)
+    negative_phrases: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         lead_id = self.lead_id or _lead_id_for(self.source_id, self.message_id)

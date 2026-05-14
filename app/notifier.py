@@ -85,6 +85,8 @@ def build_lead_card_text(lead: LeadEvent, crm: LeadCRMStatus) -> str:
     date_found = escape(lead.matched_at.strftime("%d.%m.%Y %H:%M"))
     source = _format_optional_field(lead.source_title, "неизвестно")
     message_link = _format_optional_field(lead.message_link, "нет публичной ссылки")
+    matched = ", ".join(lead.matched_phrases) or "нет"
+    score = str(lead.score) if lead.score is not None else "нет"
     return (
         "📄 <b>Карточка лида</b>\n\n"
         f"<b>Статус:</b> {escape(STATUS_TITLES.get(crm.status, crm.status))}\n"
@@ -95,7 +97,9 @@ def build_lead_card_text(lead: LeadEvent, crm: LeadCRMStatus) -> str:
         f"<b>Дата обработки:</b> {escape(crm.processed_date or 'нет')}\n"
         f"<b>Ответственный:</b> {_format_assignee(crm)}\n"
         f"<b>Источник:</b> {source}\n"
-        f"<b>Ссылка:</b> {message_link}\n\n"
+        f"<b>Ссылка:</b> {message_link}\n"
+        f"<b>Скоринг:</b> {escape(score)}\n"
+        f"<b>Совпадения:</b> {escape(matched)}\n\n"
         "<b>Сообщение:</b>\n"
         f"{escape(text) if text else 'нет'}\n\n"
         "<b>Комментарий:</b>\n"
@@ -111,6 +115,8 @@ def _build_message(lead: LeadEvent, text: str) -> str:
     message_link = _format_optional_field(lead.message_link, "нет публичной ссылки")
     date_text = escape(lead.matched_at.strftime("%d.%m.%Y %H:%M"))
     message_text = escape(text)
+    matched = ", ".join(lead.matched_phrases) or "нет"
+    score = str(lead.score) if lead.score is not None else "нет"
 
     return (
         "🆕 <b>Найден потенциальный клиент</b>\n\n"
@@ -121,7 +127,9 @@ def _build_message(lead: LeadEvent, text: str) -> str:
         f"{message_text}\n\n"
         f"<b>Дата и время:</b> {date_text}\n\n"
         f"<b>Источник:</b> {source}\n"
-        f"<b>Ссылка:</b> {message_link}"
+        f"<b>Ссылка:</b> {message_link}\n"
+        f"<b>Скоринг:</b> {escape(score)}\n"
+        f"<b>Совпадения:</b> {escape(matched)}"
     )
 
 

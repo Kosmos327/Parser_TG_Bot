@@ -8,6 +8,9 @@ from typing import Any
 
 LIST_FIELDS = {
     "trigger_words",
+    "strong_trigger_words",
+    "weak_trigger_words",
+    "negative_words",
     "exclude_words",
     "include_source_titles",
     "exclude_source_titles",
@@ -17,12 +20,16 @@ LIST_FIELDS = {
 @dataclass
 class ParserRules:
     trigger_words: list[str] = field(default_factory=list)
+    strong_trigger_words: list[str] = field(default_factory=list)
+    weak_trigger_words: list[str] = field(default_factory=list)
+    negative_words: list[str] = field(default_factory=list)
     exclude_words: list[str] = field(default_factory=list)
     include_source_titles: list[str] = field(default_factory=list)
     exclude_source_titles: list[str] = field(default_factory=list)
     min_message_length: int = 10
     ignore_bots: bool = True
     ignore_forwards: bool = False
+    min_score: int = 1
 
 
 def _dedupe_items(values: list[Any]) -> list[str]:
@@ -53,14 +60,26 @@ def _coerce_rules(data: dict[str, Any]) -> ParserRules:
     except (TypeError, ValueError):
         min_message_length = 10
 
+    trigger_words = _dedupe_items(list(data.get("trigger_words") or []))
+    strong_words = _dedupe_items(list(data["strong_trigger_words"] if "strong_trigger_words" in data else trigger_words))
+    min_score = data.get("min_score", 1)
+    try:
+        min_score = int(min_score)
+    except (TypeError, ValueError):
+        min_score = 1
+
     return ParserRules(
-        trigger_words=_dedupe_items(list(data.get("trigger_words") or [])),
+        trigger_words=trigger_words,
+        strong_trigger_words=strong_words,
+        weak_trigger_words=_dedupe_items(list(data.get("weak_trigger_words") or [])),
+        negative_words=_dedupe_items(list(data.get("negative_words") or [])),
         exclude_words=_dedupe_items(list(data.get("exclude_words") or [])),
         include_source_titles=_dedupe_items(list(data.get("include_source_titles") or [])),
         exclude_source_titles=_dedupe_items(list(data.get("exclude_source_titles") or [])),
         min_message_length=max(0, min_message_length),
         ignore_bots=_coerce_bool(data.get("ignore_bots", True)),
         ignore_forwards=_coerce_bool(data.get("ignore_forwards", False)),
+        min_score=max(-10, min(20, min_score)),
     )
 
 
@@ -68,12 +87,16 @@ def get_default_rules(settings: Any) -> ParserRules:
     """Build parser rules from legacy .env settings."""
     return ParserRules(
         trigger_words=_dedupe_items(getattr(settings, "keywords", [])),
+        strong_trigger_words=_dedupe_items(getattr(settings, "keywords", [])),
+        weak_trigger_words=[],
+        negative_words=[],
         exclude_words=_dedupe_items(getattr(settings, "exclude_keywords", [])),
         include_source_titles=_dedupe_items(getattr(settings, "include_source_titles", [])),
         exclude_source_titles=_dedupe_items(getattr(settings, "exclude_source_titles", [])),
         min_message_length=int(getattr(settings, "min_message_length", 10)),
         ignore_bots=bool(getattr(settings, "ignore_bots", True)),
         ignore_forwards=bool(getattr(settings, "ignore_forwards", False)),
+        min_score=1,
     )
 
 
@@ -152,6 +175,8 @@ def set_rule_value(path: str, field: str, value: Any, settings: Any) -> ParserRu
     rules = load_rules(path, settings)
     if field == "min_message_length":
         value = max(0, int(value))
+    elif field == "min_score":
+        value = max(-10, min(20, int(value)))
     elif field in {"ignore_bots", "ignore_forwards"}:
         value = _coerce_bool(value)
 

@@ -34,4 +34,7 @@ def ensure_lead_identity(lead: LeadEvent) -> LeadEvent:
         matched_at=lead.matched_at,
         lead_id=lead_id,
         lead_key=lead_key,
+        score=lead.score,
+        matched_phrases=list(lead.matched_phrases),
+        negative_phrases=list(lead.negative_phrases),
     )

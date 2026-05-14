@@ -2,3 +2,4 @@ telethon
 aiogram>=3,<4
 python-dotenv
 pydantic>=2,<3
+aiohttp>=3,<4
