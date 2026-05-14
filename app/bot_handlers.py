@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+from hashlib import sha1
+from time import time
 from datetime import datetime, timezone
 from pathlib import Path
 from functools import wraps
@@ -13,9 +15,11 @@ from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, Inli
 from telethon import utils
 
 from app.config import Settings, risky_settings_warnings
+from app.crm_storage import get_or_create_status, get_stats as get_crm_stats, load_crm, set_comment, set_processed_date, update_status
 from app.dialogs import dialog_info_from_entity, format_dialog_bot_item, is_source_dialog_allowed
-from app.leads_storage import count_leads, get_last_leads
+from app.leads_storage import count_leads, get_all_leads, get_last_leads, get_lead_by_key, search_leads
 from app.models import LeadEvent
+from app.notifier import STATUS_TITLES, build_lead_actions_markup, build_lead_card_text
 from app.rules_storage import LIST_FIELDS, add_rule_item, remove_rule_item, save_rules, set_rule_value
 from app.source_discovery import (
     export_candidates_txt,
@@ -65,6 +69,7 @@ def _rules_button_markup() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="🔎 Найти новые источники", callback_data="sources:find")],
             [InlineKeyboardButton(text="⚙️ Правила парсинга", callback_data="rules:menu")],
+            [InlineKeyboardButton(text="📋 Лиды / Воронка", callback_data="crm:menu")],
         ]
     )
 
@@ -77,6 +82,10 @@ def _format_help() -> str:
         "/pause — выключить обработку новых лидов\n"
         "/resume — включить обработку новых лидов\n"
         "/last — последние 5 заявок\n"
+        "/crm — меню лидов и воронки\n"
+        "/pipeline — воронка продаж\n"
+        "/leads_new, /leads_work, /leads_processed, /leads_no_target, /leads_all — списки лидов\n"
+        "/lead_search — поиск по лидам\n"
         "/last 10 — последние 10 заявок, максимум 20\n"
         "/stats — статистика сохранённых заявок\n"
         "/keywords — текущие слова-триггеры\n"
@@ -190,6 +199,8 @@ def _format_safe_config(settings: Settings, state: ParserState) -> str:
         f"ignore_forwards: {_format_bool(rules.ignore_forwards)}",
         _format_list("source_chats", settings.source_chats),
         f"leads_file: {escape(settings.leads_file)}",
+        f"crm_file: {escape(settings.crm_file)}",
+        f"leads_page_size: {settings.leads_page_size}",
         f"dedup_file: {escape(settings.dedup_file)}",
         f"log_level: {escape(settings.log_level)}",
         f"source_search_limit: {settings.source_search_limit}",
@@ -355,6 +366,7 @@ def _format_health(settings: Settings, state: ParserState, client: Any | None) -
         f"Matched count: {state.matched_count}\n"
         f"Source join: {'in progress' if state.source_join_in_progress else 'idle'}\n"
         f"Source join last report: {escape(state.source_join_last_report or 'нет')}"
+        + escape(_crm_status_appendix(settings))
     )
 
 
@@ -447,6 +459,170 @@ def _write_sources_txt(path: str, values: list[str]) -> str:
     output_path.write_text("\n".join(values) + ("\n" if values else ""), encoding="utf-8")
     return str(output_path)
 
+
+STATUS_FILTERS = {
+    "new": "new",
+    "work": "in_work",
+    "done": "processed",
+    "bad": "no_target",
+}
+FILTER_TITLES = {
+    "new": "Необработанные лиды",
+    "work": "В работе",
+    "done": "Обработанные",
+    "bad": "Нецелевые",
+    "all": "Все лиды",
+}
+
+
+def _crm_menu_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🆕 Необработанные лиды", callback_data="leads:l:new:1")],
+            [InlineKeyboardButton(text="🟡 В работе", callback_data="leads:l:work:1")],
+            [InlineKeyboardButton(text="✅ Обработанные", callback_data="leads:l:done:1")],
+            [InlineKeyboardButton(text="❌ Нецелевые", callback_data="leads:l:bad:1")],
+            [InlineKeyboardButton(text="📚 Все лиды", callback_data="leads:l:all:1")],
+            [InlineKeyboardButton(text="🔍 Поиск по лидам", callback_data="leads:search")],
+            [InlineKeyboardButton(text="📊 Воронка продаж", callback_data="crm:pipeline")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="rules:back")],
+        ]
+    )
+
+
+def _crm_menu_text() -> str:
+    return "📋 <b>Лиды / Воронка</b>"
+
+
+def _crm_stats_text(settings: Settings) -> str:
+    stats = get_crm_stats(settings.crm_file)
+    total_leads = count_leads(settings.leads_file)
+    known = stats.get("total", 0)
+    implicit_new = max(0, total_leads - known)
+    new_count = stats.get("new", 0) + implicit_new
+    total = known + implicit_new
+    return (
+        "📊 <b>Воронка продаж</b>\n\n"
+        f"Новые / необработанные: {new_count}\n"
+        f"В работе: {stats.get('in_work', 0)}\n"
+        f"Обработаны: {stats.get('processed', 0)}\n"
+        f"Нецелевые: {stats.get('no_target', 0)}\n"
+        f"Всего: {total}"
+    )
+
+
+def _pipeline_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🆕 Необработанные", callback_data="leads:l:new:1")],
+            [InlineKeyboardButton(text="🟡 В работе", callback_data="leads:l:work:1")],
+            [InlineKeyboardButton(text="✅ Обработанные", callback_data="leads:l:done:1")],
+            [InlineKeyboardButton(text="❌ Нецелевые", callback_data="leads:l:bad:1")],
+            [InlineKeyboardButton(text="📚 Все лиды", callback_data="leads:l:all:1")],
+            [InlineKeyboardButton(text="🔙 В меню CRM", callback_data="crm:menu")],
+        ]
+    )
+
+
+def _lead_user_short(lead: LeadEvent) -> str:
+    if lead.sender_username:
+        return f"@{lead.sender_username}"
+    if lead.sender_first_name:
+        return lead.sender_first_name
+    if lead.sender_id is not None:
+        return f"ID {lead.sender_id}"
+    return "неизвестно"
+
+
+def _short_text(text: str, limit: int = 50) -> str:
+    cleaned = " ".join(text.split())
+    return cleaned if len(cleaned) <= limit else f"{cleaned[: limit - 1]}…"
+
+
+def _filter_leads_for_crm(settings: Settings, filter_code: str) -> list[LeadEvent]:
+    leads = get_all_leads(settings.leads_file)
+    if filter_code == "all":
+        return leads
+    crm = load_crm(settings.crm_file)
+    desired = STATUS_FILTERS[filter_code]
+    result: list[LeadEvent] = []
+    for lead in leads:
+        status = crm.get(lead.lead_id).status if crm.get(lead.lead_id) else "new"
+        if status == desired:
+            result.append(lead)
+    return result
+
+
+def _paginate(items: list[LeadEvent], page: int, page_size: int) -> tuple[list[LeadEvent], int, int]:
+    page_size = max(1, min(page_size, 20))
+    total_pages = max(1, (len(items) + page_size - 1) // page_size)
+    page = min(max(page, 1), total_pages)
+    start = (page - 1) * page_size
+    return items[start : start + page_size], page, total_pages
+
+
+def _build_leads_list_text(settings: Settings, leads: list[LeadEvent], page: int, total_pages: int, title: str) -> str:
+    crm = load_crm(settings.crm_file)
+    lines = [f"📋 <b>{escape(title)}</b>", f"Страница {page} из {total_pages}"]
+    if not leads:
+        lines.append("\nЛиды не найдены.")
+        return "\n".join(lines)
+    lines.append("")
+    for index, lead in enumerate(leads, start=1):
+        status = crm.get(lead.lead_id).status if crm.get(lead.lead_id) else "new"
+        lines.append(
+            f"{index}. [{escape(STATUS_TITLES.get(status, status))}] "
+            f"{escape(_lead_user_short(lead))} — {escape(_short_text(lead.text))}"
+        )
+    return "\n".join(lines)
+
+
+def _build_leads_list_markup(filter_code: str, page: int, total_pages: int, leads: list[LeadEvent]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    nav: list[InlineKeyboardButton] = []
+    if page > 1:
+        nav.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"leads:l:{filter_code}:{page - 1}"))
+    if page < total_pages:
+        nav.append(InlineKeyboardButton(text="➡️ Далее", callback_data=f"leads:l:{filter_code}:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="🔄 Обновить", callback_data=f"leads:l:{filter_code}:{page}")])
+    card_buttons = [InlineKeyboardButton(text=f"📄 {index}", callback_data=f"leads:card:{lead.lead_key}") for index, lead in enumerate(leads, start=1)]
+    for start in range(0, len(card_buttons), 5):
+        rows.append(card_buttons[start : start + 5])
+    rows.append([InlineKeyboardButton(text="🔙 В меню CRM", callback_data="crm:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _build_search_markup(search_id: str, page: int, total_pages: int, leads: list[LeadEvent]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    nav: list[InlineKeyboardButton] = []
+    if page > 1:
+        nav.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"leads:s:{search_id}:{page - 1}"))
+    if page < total_pages:
+        nav.append(InlineKeyboardButton(text="➡️ Далее", callback_data=f"leads:s:{search_id}:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="🔄 Обновить", callback_data=f"leads:s:{search_id}:{page}")])
+    cards = [InlineKeyboardButton(text=f"📄 {index}", callback_data=f"leads:card:{lead.lead_key}") for index, lead in enumerate(leads, start=1)]
+    for start in range(0, len(cards), 5):
+        rows.append(cards[start : start + 5])
+    rows.append([InlineKeyboardButton(text="🔙 В меню CRM", callback_data="crm:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _crm_status_appendix(settings: Settings) -> str:
+    stats = get_crm_stats(settings.crm_file)
+    total_leads = count_leads(settings.leads_file)
+    implicit_new = max(0, total_leads - stats.get("total", 0))
+    return (
+        f"\nCRM_FILE: {settings.crm_file}\n"
+        f"CRM новые: {stats.get('new', 0) + implicit_new}\n"
+        f"CRM в работе: {stats.get('in_work', 0)}\n"
+        f"CRM обработаны: {stats.get('processed', 0)}\n"
+        f"CRM нецелевые: {stats.get('no_target', 0)}"
+    )
+
 def register_bot_handlers(
     dispatcher: Dispatcher,
     settings: Settings,
@@ -455,6 +631,7 @@ def register_bot_handlers(
 ) -> None:
     router = Router()
     pending: dict[int, PendingState] = {}
+    search_queries: dict[str, str] = {}
 
     async def send_rules_menu(message: Message) -> None:
         await message.answer(_format_rules_menu(state), reply_markup=_rules_menu_markup(state), parse_mode="HTML")
@@ -467,6 +644,73 @@ def register_bot_handlers(
 
     async def answer_category(message: Message, category: str) -> None:
         await message.answer(_format_category(category, state), reply_markup=_category_markup(category), parse_mode="HTML")
+
+
+    async def show_crm_menu(message: Message) -> None:
+        await message.answer(_crm_menu_text(), reply_markup=_crm_menu_markup(), parse_mode="HTML")
+
+    async def show_pipeline_message(message: Message) -> None:
+        await message.answer(_crm_stats_text(settings), reply_markup=_pipeline_markup(), parse_mode="HTML")
+
+    async def show_leads_list_message(message: Message, filter_code: str, page: int = 1) -> None:
+        leads, actual_page, total_pages = _paginate(
+            _filter_leads_for_crm(settings, filter_code), page, settings.leads_page_size
+        )
+        await message.answer(
+            _build_leads_list_text(settings, leads, actual_page, total_pages, FILTER_TITLES[filter_code]),
+            reply_markup=_build_leads_list_markup(filter_code, actual_page, total_pages, leads),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+
+    async def edit_leads_list_callback(callback: CallbackQuery, filter_code: str, page: int = 1) -> None:
+        leads, actual_page, total_pages = _paginate(
+            _filter_leads_for_crm(settings, filter_code), page, settings.leads_page_size
+        )
+        if callback.message:
+            await callback.message.edit_text(
+                _build_leads_list_text(settings, leads, actual_page, total_pages, FILTER_TITLES[filter_code]),
+                reply_markup=_build_leads_list_markup(filter_code, actual_page, total_pages, leads),
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+
+    async def show_lead_card(message: Message, lead_key: str) -> None:
+        lead = get_lead_by_key(settings.leads_file, lead_key)
+        if not lead:
+            await message.answer("Лид не найден.")
+            return
+        crm = get_or_create_status(settings.crm_file, lead.lead_id, lead.lead_key, lead.matched_at)
+        await message.answer(
+            build_lead_card_text(lead, crm),
+            reply_markup=build_lead_actions_markup(lead),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+
+    async def edit_lead_card(callback: CallbackQuery, lead_key: str) -> None:
+        lead = get_lead_by_key(settings.leads_file, lead_key)
+        if not lead:
+            await callback.answer("Лид не найден.", show_alert=True)
+            return
+        crm = get_or_create_status(settings.crm_file, lead.lead_id, lead.lead_key, lead.matched_at)
+        if callback.message:
+            await callback.message.edit_text(
+                build_lead_card_text(lead, crm),
+                reply_markup=build_lead_actions_markup(lead),
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+
+    async def show_search_results_message(message: Message, search_id: str, query: str, page: int = 1) -> None:
+        leads, total_pages = search_leads(settings.leads_file, settings.crm_file, query, page, settings.leads_page_size)
+        text = _build_leads_list_text(settings, leads, page, total_pages, f"Поиск: {query}")
+        await message.answer(
+            text,
+            reply_markup=_build_search_markup(search_id, page, total_pages, leads),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
 
     async def start_find_sources(message: Message) -> None:
         if telethon_client is None or not _is_telethon_connected(telethon_client):
@@ -630,10 +874,55 @@ def register_bot_handlers(
     async def rules_command(message: Message) -> None:
         await send_rules_menu(message)
 
+
+    @router.message(Command("crm"))
+    @_admin_only(settings)
+    async def crm_command(message: Message) -> None:
+        await show_crm_menu(message)
+
+    @router.message(Command("pipeline"))
+    @_admin_only(settings)
+    async def pipeline_command(message: Message) -> None:
+        await show_pipeline_message(message)
+
+    @router.message(Command("leads_new"))
+    @_admin_only(settings)
+    async def leads_new_command(message: Message) -> None:
+        await show_leads_list_message(message, "new", 1)
+
+    @router.message(Command("leads_work"))
+    @_admin_only(settings)
+    async def leads_work_command(message: Message) -> None:
+        await show_leads_list_message(message, "work", 1)
+
+    @router.message(Command("leads_processed"))
+    @_admin_only(settings)
+    async def leads_processed_command(message: Message) -> None:
+        await show_leads_list_message(message, "done", 1)
+
+    @router.message(Command("leads_no_target"))
+    @_admin_only(settings)
+    async def leads_no_target_command(message: Message) -> None:
+        await show_leads_list_message(message, "bad", 1)
+
+    @router.message(Command("leads_all"))
+    @_admin_only(settings)
+    async def leads_all_command(message: Message) -> None:
+        await show_leads_list_message(message, "all", 1)
+
+    @router.message(Command("lead_search"))
+    @_admin_only(settings)
+    async def lead_search_command(message: Message) -> None:
+        if message.from_user:
+            pending[message.from_user.id] = {"action": "lead_search", "category": ""}
+        await message.answer(
+            "Введите текст для поиска по лидам. Можно искать по логину, имени, ID, источнику, тексту сообщения или комментарию."
+        )
+
     @router.message(Command("status"))
     @_admin_only(settings)
     async def status(message: Message) -> None:
-        await message.answer(state.status_text())
+        await message.answer(state.status_text() + _crm_status_appendix(settings))
 
     @router.message(Command("pause"))
     @_admin_only(settings)
@@ -716,6 +1005,129 @@ def register_bot_handlers(
             return
 
         await message.answer(text, parse_mode="HTML")
+
+
+    @router.callback_query(lambda callback: callback.data == "crm:menu")
+    async def crm_menu_callback(callback: CallbackQuery) -> None:
+        if not is_admin_callback(callback, settings):
+            await callback.answer("Нет доступа.", show_alert=True)
+            return
+        if callback.message:
+            await callback.message.edit_text(_crm_menu_text(), reply_markup=_crm_menu_markup(), parse_mode="HTML")
+        await callback.answer()
+
+    @router.callback_query(lambda callback: callback.data == "crm:pipeline")
+    async def crm_pipeline_callback(callback: CallbackQuery) -> None:
+        if not is_admin_callback(callback, settings):
+            await callback.answer("Нет доступа.", show_alert=True)
+            return
+        if callback.message:
+            await callback.message.edit_text(_crm_stats_text(settings), reply_markup=_pipeline_markup(), parse_mode="HTML")
+        await callback.answer()
+
+    @router.callback_query(lambda callback: bool(callback.data and callback.data.startswith("leads:l:")))
+    async def leads_list_callback(callback: CallbackQuery) -> None:
+        if not is_admin_callback(callback, settings):
+            await callback.answer("Нет доступа.", show_alert=True)
+            return
+        parts = (callback.data or "").split(":")
+        if len(parts) != 4 or parts[2] not in FILTER_TITLES:
+            await callback.answer("Неизвестный список.", show_alert=True)
+            return
+        await edit_leads_list_callback(callback, parts[2], int(parts[3]))
+        await callback.answer()
+
+    @router.callback_query(lambda callback: bool(callback.data and callback.data.startswith("leads:card:")))
+    async def leads_card_callback(callback: CallbackQuery) -> None:
+        if not is_admin_callback(callback, settings):
+            await callback.answer("Нет доступа.", show_alert=True)
+            return
+        lead_key = (callback.data or "").split(":", 2)[2]
+        await edit_lead_card(callback, lead_key)
+        await callback.answer()
+
+    @router.callback_query(lambda callback: callback.data == "leads:search")
+    async def leads_search_callback(callback: CallbackQuery) -> None:
+        if not is_admin_callback(callback, settings):
+            await callback.answer("Нет доступа.", show_alert=True)
+            return
+        pending[callback.from_user.id] = {"action": "lead_search", "category": ""}
+        if callback.message:
+            await callback.message.answer(
+                "Введите текст для поиска по лидам. Можно искать по логину, имени, ID, источнику, тексту сообщения или комментарию."
+            )
+        await callback.answer()
+
+    @router.callback_query(lambda callback: bool(callback.data and callback.data.startswith("leads:s:")))
+    async def leads_search_page_callback(callback: CallbackQuery) -> None:
+        if not is_admin_callback(callback, settings):
+            await callback.answer("Нет доступа.", show_alert=True)
+            return
+        parts = (callback.data or "").split(":")
+        if len(parts) != 4 or parts[2] not in search_queries:
+            await callback.answer("Поиск устарел.", show_alert=True)
+            return
+        search_id = parts[2]
+        page = int(parts[3])
+        query = search_queries[search_id]
+        leads, total_pages = search_leads(settings.leads_file, settings.crm_file, query, page, settings.leads_page_size)
+        if callback.message:
+            await callback.message.edit_text(
+                _build_leads_list_text(settings, leads, page, total_pages, f"Поиск: {query}"),
+                reply_markup=_build_search_markup(search_id, page, total_pages, leads),
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+        await callback.answer()
+
+    @router.callback_query(lambda callback: bool(callback.data and callback.data.startswith("lead:")))
+    async def lead_action_callback(callback: CallbackQuery) -> None:
+        if not is_admin_callback(callback, settings):
+            await callback.answer("Нет доступа.", show_alert=True)
+            return
+        parts = (callback.data or "").split(":")
+        if len(parts) != 3:
+            await callback.answer("Некорректная кнопка.", show_alert=True)
+            return
+        action, lead_key = parts[1], parts[2]
+        lead = get_lead_by_key(settings.leads_file, lead_key)
+        if not lead:
+            await callback.answer("Лид не найден.", show_alert=True)
+            return
+        username = callback.from_user.username if callback.from_user else None
+        user_id = callback.from_user.id if callback.from_user else None
+        if action == "in_work":
+            update_status(settings.crm_file, lead.lead_id, lead.lead_key, "in_work", user_id, username)
+            await edit_lead_card(callback, lead_key)
+            await callback.answer("Лид взят в работу")
+            return
+        if action == "processed":
+            update_status(settings.crm_file, lead.lead_id, lead.lead_key, "processed", user_id, username)
+            await edit_lead_card(callback, lead_key)
+            await callback.answer("Лид отмечен обработанным")
+            return
+        if action == "no_target":
+            update_status(settings.crm_file, lead.lead_id, lead.lead_key, "no_target", user_id, username)
+            await edit_lead_card(callback, lead_key)
+            await callback.answer("Лид отмечен нецелевым")
+            return
+        if action == "comment":
+            pending[callback.from_user.id] = {"action": "lead_comment", "category": "", "lead_key": lead_key}
+            if callback.message:
+                await callback.message.answer("Напишите комментарий к заявке")
+            await callback.answer()
+            return
+        if action == "date":
+            pending[callback.from_user.id] = {"action": "lead_date", "category": "", "lead_key": lead_key}
+            if callback.message:
+                await callback.message.answer("Отправьте дату обработки в формате ДД.ММ.ГГГГ")
+            await callback.answer()
+            return
+        if action == "card":
+            await edit_lead_card(callback, lead_key)
+            await callback.answer()
+            return
+        await callback.answer("Неизвестное действие.", show_alert=True)
 
     @router.callback_query(lambda callback: callback.data == "sources:find")
     async def find_sources_callback(callback: CallbackQuery) -> None:
@@ -903,6 +1315,42 @@ def register_bot_handlers(
         action = current["action"]
         category = current.get("category", "")
         value = (message.text or "").strip()
+
+        if action == "lead_comment":
+            lead_key = current.get("lead_key", "")
+            lead = get_lead_by_key(settings.leads_file, lead_key)
+            if not lead:
+                await message.answer("Лид не найден.")
+                return
+            set_comment(settings.crm_file, lead.lead_id, lead.lead_key, value)
+            await message.answer("Комментарий сохранён.")
+            await show_lead_card(message, lead_key)
+            return
+
+        if action == "lead_date":
+            lead_key = current.get("lead_key", "")
+            lead = get_lead_by_key(settings.leads_file, lead_key)
+            if not lead:
+                await message.answer("Лид не найден.")
+                return
+            try:
+                set_processed_date(settings.crm_file, lead.lead_id, lead.lead_key, value)
+            except ValueError:
+                await message.answer("Ошибка: отправьте дату в формате ДД.ММ.ГГГГ.")
+                pending[user_id] = current
+                return
+            await message.answer("Дата обработки сохранена.")
+            await show_lead_card(message, lead_key)
+            return
+
+        if action == "lead_search":
+            if not value:
+                await message.answer("Пустой поисковый запрос не выполнен.")
+                return
+            search_id = sha1(f"{value}:{user_id}:{time()}".encode("utf-8")).hexdigest()[:8]
+            search_queries[search_id] = value
+            await show_search_results_message(message, search_id, value, 1)
+            return
 
         if action == "find_sources_queries":
             queries = _parse_source_queries(value)
