@@ -19,6 +19,12 @@ from app.auto_sources import run_auto_source_discovery_once
 from app.config import Settings, risky_settings_warnings
 from app.crm_storage import get_or_create_status, get_stats as get_crm_stats, load_crm, set_comment, set_processed_date, update_status
 from app.dialogs import dialog_info_from_entity, format_dialog_bot_item, is_source_dialog_allowed
+from app.source_search_settings import (
+    SourceSearchSettings,
+    load_source_search_settings,
+    reset_source_search_settings,
+    toggle_source_search_setting,
+)
 from app.leads_storage import count_leads, get_all_leads, get_last_leads, get_lead_by_key, search_leads
 from app.models import LeadEvent
 from app.notifier import STATUS_TITLES, build_lead_actions_markup, build_lead_card_text
@@ -102,18 +108,19 @@ def _rules_button_markup() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🔎 Найти новые источники", callback_data="sources:find")],
+            [InlineKeyboardButton(text="⚙️ Настройки поиска источников", callback_data="source_settings:menu")],
             [InlineKeyboardButton(text="⚙️ Правила парсинга", callback_data="rules:menu")],
             [InlineKeyboardButton(text="📋 Лиды / Воронка", callback_data="crm:menu")],
             [InlineKeyboardButton(text="📊 Статус", callback_data="main:status")],
-            [InlineKeyboardButton(text="🩺 Health", callback_data="main:health")],
-            [InlineKeyboardButton(text="🧹 Очистить ожидание", callback_data="main:pending_clear")],
+            [InlineKeyboardButton(text="🩺 Проверка работы", callback_data="main:health")],
+            [InlineKeyboardButton(text="🧹 Сбросить ожидание", callback_data="main:pending_clear")],
         ]
     )
 
 
 def _format_help() -> str:
     return (
-        "Бот управления Telegram lead parser.\n\n"
+        "Бот для поиска лидов в Telegram.\n\n"
         "Команды:\n"
         "/menu — главное меню\n"
         "/status — статус парсера\n"
@@ -130,15 +137,15 @@ def _format_help() -> str:
         "/sources — текущие источники\n"
         "/rules — открыть правила парсинга\n"
         "🔎 Найти новые источники\n"
-        "/find_sources — поиск новых источников\n"
-        "/source_candidates — найденные кандидаты\n"
-        "/source_values — строка для SOURCE_CHATS\n"
+        "/find_sources — открыть поиск новых источников\n/source_search_settings — настройки поиска источников\n"
+        "/source_candidates — найденные источники\n"
+        "/source_values — список источников для SOURCE_CHATS\n"
         "/join_debug — диагностика подписки на источники\n"
         "/pending_debug — показать текущее ожидающее действие\n"
         "/pending_clear — очистить текущее ожидающее действие\n"
         "/config — безопасная конфигурация\n"
-        "/health — состояние polling, Telethon и парсера\n"
-        "/dialogs — показать чаты/каналы, доступные Telethon-сессии\n"
+        "/health — проверка работы Telegram-бота, Telegram-сессии и парсера\n"
+        "/dialogs — показать чаты/каналы, доступные Telegram-сессии\n"
         "/auto_sources_status — статус автопоиска источников\n"
         "/auto_sources_run_now — запустить автопоиск источников сейчас\n"
         "/help — список команд"
@@ -199,19 +206,33 @@ def _admin_only(settings: Settings):
 
 
 def _format_bool(value: bool) -> str:
-    return "on" if value else "off"
+    return "да" if value else "нет"
 
 
 def _format_yes_no(value: bool) -> str:
     return "Да" if value else "Нет"
 
 
+CONFIG_LABELS = {
+    "trigger_words": "Слова-триггеры",
+    "strong_trigger_words": "Сильные триггеры",
+    "weak_trigger_words": "Слабые триггеры",
+    "negative_words": "Минус-слова",
+    "exclude_words": "Стоп-слова",
+    "include_source_titles": "Разрешённые названия источников",
+    "exclude_source_titles": "Исключённые названия источников",
+    "source_chats": "Текущие источники",
+    "auto_source_discovery_queries": "Слова для автопоиска источников",
+}
+
+
 def _format_list(title: str, values: list[str]) -> str:
+    label = CONFIG_LABELS.get(title, title)
     if not values:
-        return f"{title} (0): нет"
+        return f"{label} (0): нет"
 
     formatted = "\n".join(f"  - {escape(value)}" for value in values)
-    return f"{title} ({len(values)}):\n{formatted}"
+    return f"{label} ({len(values)}):\n{formatted}"
 
 
 def _format_uptime(started_at: datetime) -> str:
@@ -232,9 +253,9 @@ def _format_safe_config(settings: Settings, state: ParserState) -> str:
     rules = state.rules
     parts = [
         "<b>Безопасная конфигурация</b>",
-        f"rules_file: {escape(settings.rules_file)}",
-        f"parser_enabled: {_format_bool(state.enabled)}",
-        f"dry_run: {_format_bool(settings.dry_run)}",
+        f"Файл правил: {escape(settings.rules_file)}",
+        f"Парсер включён: {_format_yes_no(state.enabled)}",
+        f"Тестовый режим: {_format_yes_no(settings.dry_run)}",
         _format_list("trigger_words", rules.trigger_words),
         _format_list("strong_trigger_words", rules.strong_trigger_words),
         _format_list("weak_trigger_words", rules.weak_trigger_words),
@@ -242,34 +263,35 @@ def _format_safe_config(settings: Settings, state: ParserState) -> str:
         _format_list("exclude_words", rules.exclude_words),
         _format_list("include_source_titles", rules.include_source_titles),
         _format_list("exclude_source_titles", rules.exclude_source_titles),
-        f"min_message_length: {rules.min_message_length}",
-        f"min_score: {rules.min_score}",
-        f"ignore_bots: {_format_bool(rules.ignore_bots)}",
-        f"ignore_forwards: {_format_bool(rules.ignore_forwards)}",
+        f"Мин. длина сообщения: {rules.min_message_length}",
+        f"Минимальный скоринг: {rules.min_score}",
+        f"Игнорировать ботов: {_format_yes_no(rules.ignore_bots)}",
+        f"Игнорировать пересланные: {_format_yes_no(rules.ignore_forwards)}",
         _format_list("source_chats", settings.source_chats),
-        f"leads_file: {escape(settings.leads_file)}",
-        f"crm_file: {escape(settings.crm_file)}",
-        f"leads_page_size: {settings.leads_page_size}",
-        f"dedup_file: {escape(settings.dedup_file)}",
-        f"log_level: {escape(settings.log_level)}",
-        f"source_search_limit: {settings.source_search_limit}",
-        f"join_batch_limit: {settings.join_batch_limit}",
-        f"join_delay_seconds: {settings.join_delay_seconds}",
-        f"exclude_private_chats: {_format_bool(settings.exclude_private_chats)}",
-        f"source_candidates_file: {escape(settings.source_candidates_file)}",
-        f"source_export_file: {escape(settings.source_export_file)}",
-        f"lead_dedup_enabled: {_format_bool(settings.lead_dedup_enabled)}",
-        f"lead_dedup_window_hours: {settings.lead_dedup_window_hours}",
-        f"lead_dedup_similarity_threshold: {settings.lead_dedup_similarity_threshold}",
-        f"auto_source_discovery_enabled: {_format_bool(settings.auto_source_discovery_enabled)}",
+        f"Файл лидов: {escape(settings.leads_file)}",
+        f"Файл CRM: {escape(settings.crm_file)}",
+        f"Лидов на странице: {settings.leads_page_size}",
+        f"Файл антидублей: {escape(settings.dedup_file)}",
+        f"Уровень логов: {escape(settings.log_level)}",
+        f"Лимит поиска источников: {settings.source_search_limit}",
+        f"Файл настроек поиска источников: {escape(settings.source_search_settings_file)}",
+        f"Лимит подписок за запуск: {settings.join_batch_limit}",
+        f"Задержка между подписками: {settings.join_delay_seconds}",
+        f"Исключать личные чаты по умолчанию: {_format_yes_no(settings.exclude_private_chats)}",
+        f"Файл найденных источников: {escape(settings.source_candidates_file)}",
+        f"TXT-файл источников: {escape(settings.source_export_file)}",
+        f"Антидубли включены: {_format_yes_no(settings.lead_dedup_enabled)}",
+        f"Окно антидублей, часов: {settings.lead_dedup_window_hours}",
+        f"Порог похожести дублей: {settings.lead_dedup_similarity_threshold}",
+        f"Автопоиск источников включён: {_format_yes_no(settings.auto_source_discovery_enabled)}",
         _format_list("auto_source_discovery_queries", settings.auto_source_discovery_queries),
-        f"auto_source_discovery_interval_hours: {settings.auto_source_discovery_interval_hours}",
-        f"auto_source_discovery_limit: {settings.auto_source_discovery_limit}",
-        f"auto_source_auto_join: {_format_bool(settings.auto_source_auto_join)}",
-        f"auto_source_join_limit: {settings.auto_source_join_limit}",
-        f"web_dashboard_enabled: {_format_bool(settings.web_dashboard_enabled)}",
-        f"web_dashboard_host: {escape(settings.web_dashboard_host)}",
-        f"web_dashboard_port: {settings.web_dashboard_port}",
+        f"Интервал автопоиска, часов: {settings.auto_source_discovery_interval_hours}",
+        f"Лимит автопоиска: {settings.auto_source_discovery_limit}",
+        f"Автоподписка включена: {_format_yes_no(settings.auto_source_auto_join)}",
+        f"Лимит автоподписки: {settings.auto_source_join_limit}",
+        f"Web-панель включена: {_format_yes_no(settings.web_dashboard_enabled)}",
+        f"Адрес web-панели: {escape(settings.web_dashboard_host)}",
+        f"Порт web-панели: {settings.web_dashboard_port}",
     ]
     warnings = risky_settings_warnings(settings)
     if warnings:
@@ -375,7 +397,7 @@ def _is_telethon_connected(client: Any | None) -> bool:
         return False
 
 
-async def _format_available_dialogs(client: Any, exclude_private_chats: bool = True, limit: int = 20, max_length: int = 3800) -> str:
+async def _format_available_dialogs(client: Any, source_settings: SourceSearchSettings, limit: int = 20, max_length: int = 3800) -> str:
     parts = ["<b>📡 Доступные источники</b>"]
     count = 0
     has_more = False
@@ -385,7 +407,7 @@ async def _format_available_dialogs(client: Any, exclude_private_chats: bool = T
             has_more = True
             break
 
-        if not is_source_dialog_allowed(dialog, exclude_private_chats):
+        if not is_source_dialog_allowed(dialog, source_settings=source_settings):
             continue
 
         entity = dialog.entity
@@ -404,7 +426,8 @@ async def _format_available_dialogs(client: Any, exclude_private_chats: bool = T
     if has_more:
         footer = (
             f"Показаны первые {count}. Полный список можно получить командой:\n"
-            "<code>python list_dialogs.py --limit 500</code>"
+            "<code>python list_dialogs.py --limit 500</code>\n"
+            "Все диалоги без фильтров: <code>python list_dialogs.py --all</code>"
         )
         candidate = "\n\n".join([*parts, footer])
         if len(candidate) <= max_length:
@@ -423,21 +446,23 @@ def _telethon_status(client: Any | None) -> str:
 
 
 def _format_health(settings: Settings, state: ParserState, client: Any | None) -> str:
+    status = _telethon_status(client)
+    session_text = "подключена" if status == "connected" else "не подключена" if status == "disconnected" else "неизвестно"
     return (
-        "<b>Health</b>\n"
-        "Bot polling: OK\n"
-        f"Telethon client: {_telethon_status(client)}\n"
-        f"Parser: {'enabled' if state.enabled else 'disabled'}\n"
-        f"Dry-run: {'on' if settings.dry_run else 'off'}\n"
-        f"Last error: {escape(state.last_error or 'нет')}\n"
-        f"Uptime: {_format_uptime(state.started_at)}\n"
-        f"Processed count: {state.processed_count}\n"
-        f"Matched count: {state.matched_count}\n"
-        f"Duplicate count: {state.duplicate_count}\n"
-        f"Source join: {'in progress' if state.source_join_in_progress else 'idle'}\n"
-        f"Source join last report: {escape(state.source_join_last_report or 'нет')}\n"
-        f"Auto source discovery: {'in progress' if state.auto_source_discovery_in_progress else 'idle'}\n"
-        f"Auto source discovery last report: {escape(state.auto_source_discovery_last_report or 'нет')}"
+        "<b>🩺 Проверка работы</b>\n"
+        "Telegram-бот: работает\n"
+        f"Telegram-сессия: {session_text}\n"
+        f"Парсер: {'включён' if state.enabled else 'выключен'}\n"
+        f"Тестовый режим: {'да' if settings.dry_run else 'нет'}\n"
+        f"Последняя ошибка: {escape(state.last_error or 'нет')}\n"
+        f"Время работы: {_format_uptime(state.started_at)}\n"
+        f"Обработано сообщений: {state.processed_count}\n"
+        f"Найдено лидов: {state.matched_count}\n"
+        f"Отсеяно дублей: {state.duplicate_count}\n"
+        f"Подписка на источники: {'идёт' if state.source_join_in_progress else 'нет'}\n"
+        f"Последний отчёт по подписке: {escape(state.source_join_last_report or 'нет')}\n"
+        f"Автопоиск источников: {'идёт' if state.auto_source_discovery_in_progress else 'нет'}\n"
+        f"Последний отчёт автопоиска: {escape(state.auto_source_discovery_last_report or 'нет')}"
         + escape(_crm_status_appendix(settings))
     )
 
@@ -449,10 +474,63 @@ def _user_key(message: Message) -> int | None:
 
 def _find_sources_prompt() -> str:
     return (
-        "Напишите слова/фразы, по которым нужно искать каналы. Можно несколько строк, например:\n"
+        "Напишите слова/фразы, по которым нужно искать источники. Можно несколько строк, например:\n"
         "налоги\n"
         "бухгалтерия\n"
         "ип"
+    )
+
+
+def _format_source_search_summary(source_settings: SourceSearchSettings) -> str:
+    private_text = "личные чаты исключены" if source_settings.exclude_private_chats else "личные чаты разрешены"
+    return (
+        "Сейчас бот ищет:\n"
+        f"{'✅' if source_settings.include_public_channels else '☑️'} публичные каналы\n"
+        f"{'✅' if source_settings.include_public_groups else '☑️'} публичные группы\n"
+        f"{'✅' if source_settings.include_group_chats else '☑️'} групповые чаты\n"
+        f"{'✅' if source_settings.include_supergroups else '☑️'} супергруппы\n"
+        f"{'✅' if source_settings.exclude_private_chats else '☑️'} {private_text}"
+    )
+
+
+def _source_search_start_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔎 Начать поиск", callback_data="sources:start_search")],
+            [InlineKeyboardButton(text="⚙️ Настройки поиска", callback_data="source_settings:menu")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="rules:back")],
+        ]
+    )
+
+
+def _source_search_settings_markup(source_settings: SourceSearchSettings) -> InlineKeyboardMarkup:
+    def button(field: str, label: str) -> InlineKeyboardButton:
+        checked = "✅" if bool(getattr(source_settings, field)) else "☑️"
+        return InlineKeyboardButton(text=f"{checked} {label}", callback_data=f"source_settings:toggle:{field}")
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [button("include_public_channels", "Публичные каналы")],
+            [button("include_public_groups", "Публичные группы")],
+            [button("include_group_chats", "Групповые чаты")],
+            [button("include_supergroups", "Супергруппы")],
+            [button("exclude_private_chats", "Исключать личные чаты")],
+            [InlineKeyboardButton(text="🔄 Сбросить по умолчанию", callback_data="source_settings:reset")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="sources:find")],
+        ]
+    )
+
+
+def _format_source_search_settings_menu(source_settings: SourceSearchSettings) -> str:
+    return (
+        "⚙️ <b>Настройки поиска источников</b>\n\n"
+        "Искать в:\n"
+        f"{'✅' if source_settings.include_public_channels else '☑️'} Публичные каналы\n"
+        f"{'✅' if source_settings.include_public_groups else '☑️'} Публичные группы\n"
+        f"{'✅' if source_settings.include_group_chats else '☑️'} Групповые чаты\n"
+        f"{'✅' if source_settings.include_supergroups else '☑️'} Супергруппы\n\n"
+        "Дополнительно:\n"
+        f"{'✅' if source_settings.exclude_private_chats else '☑️'} Исключать личные чаты"
     )
 
 
@@ -539,20 +617,20 @@ def _pending_state(action: str, **values: Any) -> PendingState:
 
 def _format_pending_debug(user_id: int | None, current: PendingState | None) -> str:
     if not current:
-        return f"Pending debug for user_id={user_id or 'unknown'}:\npending: no"
+        return f"Диагностика ожидания для пользователя {user_id or 'unknown'}:\nОжидающее действие: нет"
 
     keys = sorted(str(key) for key in current.keys())
     source_values = current.get("source_values") or []
     source_values_count = len(source_values) if isinstance(source_values, list) else 0
     search_text = current.get("query") or current.get("text") or current.get("search") or ""
     return (
-        f"Pending debug for user_id={user_id or 'unknown'}:\n"
-        "pending: yes\n"
-        f"action: {current.get('action') or 'нет'}\n"
-        f"keys: {', '.join(keys) if keys else 'нет'}\n"
-        f"source_values_count: {source_values_count}\n"
-        f"search_text: {search_text or 'нет'}\n"
-        f"timestamp: {current.get('timestamp') or 'нет'}"
+        f"Диагностика ожидания для пользователя {user_id or 'unknown'}:\n"
+        "Ожидающее действие: да\n"
+        f"Действие: {current.get('action') or 'нет'}\n"
+        f"Поля диагностики: {', '.join(keys) if keys else 'нет'}\n"
+        f"Источников в ожидании: {source_values_count}\n"
+        f"Текст поиска: {search_text or 'нет'}\n"
+        f"Создано: {current.get('timestamp') or 'нет'}"
     )
 
 
@@ -846,6 +924,24 @@ def register_bot_handlers(
             disable_web_page_preview=True,
         )
 
+    def current_source_settings() -> SourceSearchSettings:
+        return load_source_search_settings(settings.source_search_settings_file, settings)
+
+    async def show_source_search_start(message: Message) -> None:
+        source_settings = current_source_settings()
+        await message.answer(
+            _format_source_search_summary(source_settings),
+            reply_markup=_source_search_start_markup(),
+        )
+
+    async def show_source_search_settings(message: Message) -> None:
+        source_settings = current_source_settings()
+        await message.answer(
+            _format_source_search_settings_menu(source_settings),
+            reply_markup=_source_search_settings_markup(source_settings),
+            parse_mode="HTML",
+        )
+
     async def start_find_sources(message: Message, user_id: int | None = None) -> None:
         if user_id is None:
             user_id = _user_key(message)
@@ -861,11 +957,11 @@ def register_bot_handlers(
     async def run_source_search(message: Message, queries: list[str]) -> None:
         await message.answer(f"Ищу источники по {len(queries)} запросам. Лимит: {settings.source_search_limit} на запрос.")
         if telethon_client is None or not _is_telethon_connected(telethon_client):
-            await message.answer("Telethon client недоступен или не подключён. Проверьте /health и перезапустите бот при необходимости.")
+            await message.answer("Telegram-сессия недоступна или не подключена. Проверьте /health и перезапустите бот при необходимости.")
             return
 
         try:
-            found = await search_sources(telethon_client, queries, settings.source_search_limit)
+            found = await search_sources(telethon_client, queries, settings.source_search_limit, current_source_settings())
             existing = load_candidates(settings.source_candidates_file)
             merged = merge_candidates(existing, found)
             save_candidates(merged, settings.source_candidates_file)
@@ -891,9 +987,9 @@ def register_bot_handlers(
             return
 
         if Path(export_path).exists() and Path(export_path).stat().st_size > 0:
-            await message.answer_document(FSInputFile(export_path, filename="source_candidates.txt"))
+            await message.answer_document(FSInputFile(export_path, filename="found_sources.txt"))
         await message.answer(
-            f"Нашёл {found_public_count} источников с публичным username. Файл приложен.\nПродолжить поиск?",
+            f"Нашёл {found_public_count} источников, доступных для подписки. Файл приложен.\nПродолжить поиск?",
             reply_markup=_continue_search_markup(),
         )
 
@@ -934,7 +1030,7 @@ def register_bot_handlers(
             return
         state.source_join_in_progress = True
         state.source_join_started_at = datetime.now(timezone.utc)
-        state.source_join_last_report = f"started {mode} join: {len(sources)} sources"
+        state.source_join_last_report = f"подписка начата: {len(sources)} источников"
         logger.info("source join started mode=%s source_count=%s", mode, len(sources))
         attempted = 0
 
@@ -992,7 +1088,7 @@ def register_bot_handlers(
             return
         state.source_join_in_progress = True
         state.source_join_started_at = datetime.now(timezone.utc)
-        state.source_join_last_report = f"started {mode} join: {len(source_values)} sources"
+        state.source_join_last_report = f"подписка начата: {len(source_values)} источников"
         logger.info("source join task scheduled mode=%s source_count=%s", mode, len(source_values))
         await message.answer(
             "Подписка запущена. Это может занять время. Статус можно смотреть через /join_debug, /status или /health."
@@ -1020,7 +1116,12 @@ def register_bot_handlers(
     @router.message(Command("find_sources"))
     @_admin_only(settings)
     async def find_sources_command(message: Message) -> None:
-        await start_find_sources(message)
+        await show_source_search_start(message)
+
+    @router.message(Command("source_search_settings"))
+    @_admin_only(settings)
+    async def source_search_settings_command(message: Message) -> None:
+        await show_source_search_settings(message)
 
     @router.message(Command("source_candidates"))
     @_admin_only(settings)
@@ -1028,12 +1129,12 @@ def register_bot_handlers(
         candidates = load_candidates(settings.source_candidates_file)
         public_count = len([candidate for candidate in candidates if _candidate_username(candidate)])
         if not candidates:
-            await message.answer("Кандидаты ещё не найдены. Запустите /find_sources.")
+            await message.answer("Найденных источников пока нет. Запустите /find_sources.")
             return
         export_path = export_candidates_txt(candidates, settings.source_export_file)
         if Path(export_path).exists() and Path(export_path).stat().st_size > 0:
-            await message.answer_document(FSInputFile(export_path, filename="source_candidates.txt"))
-        await message.answer(f"Всего кандидатов: {len(candidates)}. С публичным username: {public_count}.")
+            await message.answer_document(FSInputFile(export_path, filename="found_sources.txt"))
+        await message.answer(f"Всего найденных источников: {len(candidates)}. Доступны для подписки: {public_count}.")
 
     @router.message(Command("source_values"))
     @_admin_only(settings)
@@ -1041,9 +1142,9 @@ def register_bot_handlers(
         candidates = load_candidates(settings.source_candidates_file)
         values = [username for candidate in candidates if (username := _candidate_username(candidate))]
         if not values:
-            await message.answer("Нет найденных публичных username для SOURCE_CHATS.")
+            await message.answer("Нет найденных публичных username для списка источников SOURCE_CHATS.")
             return
-        await message.answer("SOURCE_CHATS=" + ",".join(values[:100]))
+        await message.answer("Список источников для SOURCE_CHATS:\n" + ",".join(values[:100]))
 
     @router.message(Command("join_debug"))
     @_admin_only(settings)
@@ -1061,17 +1162,17 @@ def register_bot_handlers(
         joinable_source_values = _candidate_source_values_for_join(joinable)
         joinable_preview = "\n".join(escape(value) for value in joinable_source_values[:10]) or "нет"
         await message.answer(
-            "<b>Source join debug</b>\n"
-            f"source_join_in_progress: {state.source_join_in_progress}\n"
-            f"source_join_started_at: {escape(started_at)}\n"
-            f"source_join_last_report: {escape(state.source_join_last_report or 'нет')}\n"
-            f"pending_action: {escape(str(current_pending.get('action') or 'нет'))}\n"
-            f"pending_source_values_count: {len(pending_source_values)}\n"
-            f"SOURCE_CANDIDATES_FILE candidates: {len(candidates)}\n"
-            f"joinable: {len(joinable)}\n"
-            f"first_joinable_source_values:\n{joinable_preview}\n"
-            f"JOIN_BATCH_LIMIT: {settings.join_batch_limit}\n"
-            f"JOIN_DELAY_SECONDS: {settings.join_delay_seconds}",
+            "<b>Диагностика подписки на источники</b>\n"
+            f"Идёт подписка на источники: {_format_yes_no(state.source_join_in_progress)}\n"
+            f"Подписка начата: {escape(started_at)}\n"
+            f"Последний отчёт по подписке: {escape(state.source_join_last_report or 'нет')}\n"
+            f"Ожидающее действие: {escape(str(current_pending.get('action') or 'нет'))}\n"
+            f"Источников в ожидании: {len(pending_source_values)}\n"
+            f"Файл найденных источников: {len(candidates)} записей\n"
+            f"Доступны для подписки: {len(joinable)}\n"
+            f"Первые источники для подписки:\n{joinable_preview}\n"
+            f"Лимит подписок за запуск: {settings.join_batch_limit}\n"
+            f"Задержка между подписками: {settings.join_delay_seconds}",
             parse_mode="HTML",
         )
 
@@ -1232,16 +1333,16 @@ def register_bot_handlers(
     @_admin_only(settings)
     async def dialogs(message: Message) -> None:
         if telethon_client is None:
-            await message.answer("Telethon client недоступен. Запустите приложение через python -m app.main.")
+            await message.answer("Telegram-сессия недоступна. Запустите приложение через python -m app.main.")
             return
         if not _is_telethon_connected(telethon_client):
-            await message.answer("Telethon client не подключён. Проверьте /health и перезапустите приложение при необходимости.")
+            await message.answer("Telegram-сессия не подключена. Проверьте /health и перезапустите приложение при необходимости.")
             return
 
         try:
-            text = await _format_available_dialogs(telethon_client, settings.exclude_private_chats)
+            text = await _format_available_dialogs(telethon_client, current_source_settings())
         except Exception as exc:
-            await message.answer(f"Не удалось получить список диалогов Telethon: {escape(str(exc))}", parse_mode="HTML")
+            await message.answer(f"Не удалось получить список диалогов Telegram-сессии: {escape(str(exc))}", parse_mode="HTML")
             return
 
         await message.answer(text, parse_mode="HTML")
@@ -1403,7 +1504,7 @@ def register_bot_handlers(
             await callback.answer("Нет доступа.", show_alert=True)
             return
         if callback.message:
-            await start_find_sources(callback.message, callback.from_user.id)
+            await show_source_search_start(callback.message)
         await callback.answer()
 
     @router.callback_query(lambda callback: callback.data == "sources:continue")
@@ -1414,6 +1515,57 @@ def register_bot_handlers(
         if callback.message:
             await start_find_sources(callback.message, callback.from_user.id)
         await callback.answer()
+
+    @router.callback_query(lambda callback: callback.data == "sources:start_search")
+    async def start_source_search_callback(callback: CallbackQuery) -> None:
+        if not is_admin_callback(callback, settings):
+            await callback.answer("Нет доступа.", show_alert=True)
+            return
+        if callback.message:
+            await start_find_sources(callback.message, callback.from_user.id)
+        await callback.answer()
+
+    @router.callback_query(lambda callback: callback.data == "source_settings:menu")
+    async def source_settings_menu_callback(callback: CallbackQuery) -> None:
+        if not is_admin_callback(callback, settings):
+            await callback.answer("Нет доступа.", show_alert=True)
+            return
+        if callback.message:
+            await show_source_search_settings(callback.message)
+        await callback.answer()
+
+    @router.callback_query(lambda callback: bool(callback.data and callback.data.startswith("source_settings:toggle:")))
+    async def source_settings_toggle_callback(callback: CallbackQuery) -> None:
+        if not is_admin_callback(callback, settings):
+            await callback.answer("Нет доступа.", show_alert=True)
+            return
+        field = (callback.data or "").split(":", 2)[2]
+        try:
+            source_settings = toggle_source_search_setting(settings.source_search_settings_file, field, settings)
+        except ValueError:
+            await callback.answer("Неизвестная настройка.", show_alert=True)
+            return
+        if callback.message:
+            await callback.message.edit_text(
+                _format_source_search_settings_menu(source_settings),
+                reply_markup=_source_search_settings_markup(source_settings),
+                parse_mode="HTML",
+            )
+        await callback.answer("Сохранено.")
+
+    @router.callback_query(lambda callback: callback.data == "source_settings:reset")
+    async def source_settings_reset_callback(callback: CallbackQuery) -> None:
+        if not is_admin_callback(callback, settings):
+            await callback.answer("Нет доступа.", show_alert=True)
+            return
+        source_settings = reset_source_search_settings(settings.source_search_settings_file, settings)
+        if callback.message:
+            await callback.message.edit_text(
+                _format_source_search_settings_menu(source_settings),
+                reply_markup=_source_search_settings_markup(source_settings),
+                parse_mode="HTML",
+            )
+        await callback.answer("Настройки сброшены.")
 
     @router.callback_query(lambda callback: callback.data == "sources:subscribe_step")
     async def subscribe_step_callback(callback: CallbackQuery) -> None:

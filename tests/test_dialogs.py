@@ -41,7 +41,7 @@ def test_cli_format_contains_source_chats_and_access_hash_note() -> None:
 
     formatted = format_dialog_cli_item(info, 1)
 
-    assert "SOURCE_CHATS: @business_chat" in formatted
+    assert "Значение для списка источников: @business_chat" in formatted
     assert "Access hash: 987654321 (не вставляйте в .env)" in formatted
 
 
@@ -52,7 +52,7 @@ def test_bot_format_escapes_html_and_hides_access_hash() -> None:
     formatted = format_dialog_bot_item(info, 1)
 
     assert "&lt;Business&gt;" in formatted
-    assert "SOURCE_CHATS: -1001234567890" in formatted
+    assert "Значение для списка источников: -1001234567890" in formatted
     assert "987654321" not in formatted
 
 from app.dialogs import is_source_dialog_allowed

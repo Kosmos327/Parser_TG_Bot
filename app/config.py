@@ -31,6 +31,7 @@ class Settings(BaseModel):
     max_text_length: int
     log_level: str
     source_search_limit: int
+    source_search_settings_file: str
     join_batch_limit: int
     join_delay_seconds: int
     exclude_private_chats: bool
@@ -61,6 +62,7 @@ class Settings(BaseModel):
         "crm_file",
         "source_candidates_file",
         "source_export_file",
+        "source_search_settings_file",
     )
     @classmethod
     def _not_empty(cls, value: str, info: Any) -> str:
@@ -224,6 +226,7 @@ def load_settings() -> Settings:
         "max_text_length": _parse_int(os.getenv("MAX_TEXT_LENGTH"), 3500, "MAX_TEXT_LENGTH"),
         "log_level": _optional_env("LOG_LEVEL", "INFO"),
         "source_search_limit": _parse_int(os.getenv("SOURCE_SEARCH_LIMIT"), 100, "SOURCE_SEARCH_LIMIT"),
+        "source_search_settings_file": _optional_env("SOURCE_SEARCH_SETTINGS_FILE", "data/source_search_settings.json"),
         "join_batch_limit": _parse_int(os.getenv("JOIN_BATCH_LIMIT"), 10, "JOIN_BATCH_LIMIT"),
         "join_delay_seconds": _parse_int(os.getenv("JOIN_DELAY_SECONDS"), 90, "JOIN_DELAY_SECONDS"),
         "exclude_private_chats": _parse_bool(os.getenv("EXCLUDE_PRIVATE_CHATS"), True),

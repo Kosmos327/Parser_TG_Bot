@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.source_discovery import export_candidates_txt, filter_joinable_candidates, load_candidates, mark_candidate_status, merge_candidates, save_candidates, search_sources
+from app.source_search_settings import load_source_search_settings
 from app.source_joiner import join_sources_limited
 
 logger = logging.getLogger(__name__)
@@ -29,14 +30,15 @@ async def run_auto_source_discovery_once(settings: Any, state: Any, client: Any,
     state.auto_source_discovery_last_run = datetime.now(timezone.utc)
     try:
         if not _is_connected(client):
-            raise RuntimeError("Telethon client недоступен или не подключён")
+            raise RuntimeError("Telegram-сессия недоступна или не подключена")
         existing = load_candidates(settings.source_candidates_file)
-        found = await search_sources(client, settings.auto_source_discovery_queries, settings.auto_source_discovery_limit)
+        source_settings = load_source_search_settings(settings.source_search_settings_file, settings)
+        found = await search_sources(client, settings.auto_source_discovery_queries, settings.auto_source_discovery_limit, source_settings)
         merged = merge_candidates(existing, found)
         save_candidates(merged, settings.source_candidates_file)
         export_candidates_txt(merged, settings.source_export_file)
         new_count = max(0, len(merged) - len(existing))
-        report = f"Автопоиск источников завершён. Найдено новых: {new_count}. Всего кандидатов: {len(merged)}."
+        report = f"Автопоиск источников завершён. Найдено новых: {new_count}. Всего найденных источников: {len(merged)}."
 
         if settings.auto_source_auto_join:
             joinable = filter_joinable_candidates(merged)
