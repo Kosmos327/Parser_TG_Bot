@@ -117,7 +117,7 @@ def filter_joinable_candidates(candidates: list[dict[str, Any]]) -> list[dict[st
     """Return candidates safe to feed into the limited public-username join flow."""
     joinable: list[dict[str, Any]] = []
     for candidate in candidates:
-        username = _public_username(candidate.get("username"))
+        username = _public_username(candidate.get("source_chats_value")) or _public_username(candidate.get("username"))
         if not username:
             continue
         if candidate.get("joined") or candidate.get("skipped") or candidate.get("manual_required") or candidate.get("error"):

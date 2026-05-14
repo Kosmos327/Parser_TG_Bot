@@ -421,6 +421,40 @@ def _confirm_join_markup(mode: str) -> InlineKeyboardMarkup:
     )
 
 
+def _normalize_source_values_for_join(values: list[str]) -> list[str]:
+    """Normalize source values to unique public @username entries for joining."""
+    return parse_sources_text("\n".join(str(value) for value in values if value))
+
+
+def _candidate_source_values_for_join(candidates: list[dict[str, Any]]) -> list[str]:
+    """Extract normalized join values from already-filtered joinable candidates."""
+    raw_values: list[str] = []
+    for candidate in candidates:
+        source_value = str(candidate.get("source_chats_value") or "")
+        username = str(candidate.get("username") or "")
+        raw_values.append(source_value if parse_sources_text(source_value) else username)
+    return _normalize_source_values_for_join(raw_values)
+
+
+def _load_joinable_source_values_from_candidates_file(path: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+    """Load candidates file and return all candidates, joinable candidates and source values."""
+    candidates = load_candidates(path)
+    joinable = filter_joinable_candidates(candidates)
+    source_values = _candidate_source_values_for_join(joinable)
+    return candidates, joinable, source_values
+
+
+def _prepare_join_confirmation(source_values: list[str], settings: Settings, mode: str) -> tuple[str, InlineKeyboardMarkup]:
+    """Build confirmation text and buttons for a safe source join run."""
+    text = (
+        f"Принял {len(source_values)} источников.\n"
+        "Подписаться безопасной партией?\n"
+        f"Максимум за запуск: {settings.join_batch_limit}\n"
+        f"Задержка между подписками: {settings.join_delay_seconds} секунд"
+    )
+    return text, _confirm_join_markup(mode)
+
+
 def _parse_source_queries(text: str) -> list[str]:
     queries: list[str] = []
     for line in text.splitlines():
@@ -753,39 +787,42 @@ def register_bot_handlers(
     async def ask_subscription_choice(message: Message) -> None:
         await message.answer("Подписаться на найденные источники?", reply_markup=_subscription_choice_markup())
 
-    async def prepare_join_all(message: Message) -> None:
-        candidates = filter_joinable_candidates(load_candidates(settings.source_candidates_file))
-        sources = [username for candidate in candidates if (username := _candidate_username(candidate))]
-        if not sources:
-            await message.answer("Нет найденных username-источников, доступных для автоматической подписки.")
-            return
-        user_id = _user_key(message)
-        if user_id is not None:
-            pending[user_id] = {"action": "confirm_join_all", "category": "", "sources": sources}
-        await message.answer(
-            f"Принял {len(sources)} источников.\n"
-            "Подписаться безопасной партией?\n"
-            f"Максимум за запуск: {settings.join_batch_limit}\n"
-            f"Задержка между подписками: {settings.join_delay_seconds} секунд",
-            reply_markup=_confirm_join_markup("all"),
+    async def prepare_join_all(message: Message, user_id: int | None = None) -> None:
+        candidates, joinable, source_values = _load_joinable_source_values_from_candidates_file(settings.source_candidates_file)
+        logger.info(
+            "source join_all pressed candidates=%s joinable=%s source_values=%s",
+            len(candidates),
+            len(joinable),
+            len(source_values),
         )
-
-    async def prepare_selective_join(message: Message) -> None:
-        user_id = _user_key(message)
+        if not source_values:
+            await message.answer("Нет списка источников для подписки.")
+            return
+        if user_id is None:
+            user_id = _user_key(message)
         if user_id is not None:
-            pending[user_id] = {"action": "selective_sources", "category": ""}
+            pending[user_id] = {"action": "source_join_confirm", "source_values": source_values, "mode": "all"}
+        text, markup = _prepare_join_confirmation(source_values, settings, "all")
+        await message.answer(text, reply_markup=markup)
+
+    async def prepare_selective_join(message: Message, user_id: int | None = None) -> None:
+        if user_id is None:
+            user_id = _user_key(message)
+        if user_id is not None:
+            pending[user_id] = {"action": "source_join_selective_wait_list"}
         await message.answer(
             "Пришлите список каналов, на которые нужно подписаться. Можно столбиком:\n"
             "@channel1\n@channel2\nhttps://t.me/channel3"
         )
 
-    async def run_join_background(bot_obj: Any, chat_id: int, sources: list[str], *, already_marked_started: bool = False) -> None:
+    async def run_join_background(bot_obj: Any, chat_id: int, sources: list[str], *, mode: str, already_marked_started: bool = False) -> None:
         if state.source_join_in_progress and not already_marked_started:
             await bot_obj.send_message(chat_id, "Подписка уже выполняется. Дождитесь завершения.")
             return
         state.source_join_in_progress = True
         state.source_join_started_at = datetime.now(timezone.utc)
-        state.source_join_last_report = f"started selective join: {len(sources)} sources"
+        state.source_join_last_report = f"started {mode} join: {len(sources)} sources"
+        logger.info("source join started mode=%s source_count=%s", mode, len(sources))
         attempted = 0
 
         async def progress(source: str, status: str) -> None:
@@ -835,18 +872,20 @@ def register_bot_handlers(
         finally:
             state.source_join_in_progress = False
 
-    async def confirm_join(message: Message, sources: list[str]) -> None:
+    async def _start_join_task(message: Message, sources: list[str], *, mode: str) -> None:
+        source_values = _normalize_source_values_for_join(sources)
         if state.source_join_in_progress:
             await message.answer("Подписка уже выполняется. Дождитесь завершения.")
             return
         state.source_join_in_progress = True
         state.source_join_started_at = datetime.now(timezone.utc)
-        state.source_join_last_report = f"started selective join: {len(sources)} sources"
+        state.source_join_last_report = f"started {mode} join: {len(source_values)} sources"
+        logger.info("source join task scheduled mode=%s source_count=%s", mode, len(source_values))
         await message.answer(
-            "Подписка запущена. Это может занять время. Статус можно смотреть через /status или /health."
+            "Подписка запущена. Это может занять время. Статус можно смотреть через /join_debug, /status или /health."
         )
         asyncio.create_task(
-            run_join_background(message.bot, message.chat.id, sources, already_marked_started=True),
+            run_join_background(message.bot, message.chat.id, source_values, mode=mode, already_marked_started=True),
             name="source-join",
         )
 
@@ -898,13 +937,21 @@ def register_bot_handlers(
             if state.source_join_started_at
             else "нет"
         )
+        user_id = _user_key(message)
+        current_pending = pending.get(user_id or 0, {}) if user_id is not None else {}
+        pending_source_values = list(current_pending.get("source_values") or [])
+        joinable_source_values = _candidate_source_values_for_join(joinable)
+        joinable_preview = "\n".join(escape(value) for value in joinable_source_values[:10]) or "нет"
         await message.answer(
             "<b>Source join debug</b>\n"
             f"source_join_in_progress: {state.source_join_in_progress}\n"
             f"source_join_started_at: {escape(started_at)}\n"
             f"source_join_last_report: {escape(state.source_join_last_report or 'нет')}\n"
+            f"pending_action: {escape(str(current_pending.get('action') or 'нет'))}\n"
+            f"pending_source_values_count: {len(pending_source_values)}\n"
             f"SOURCE_CANDIDATES_FILE candidates: {len(candidates)}\n"
             f"joinable: {len(joinable)}\n"
+            f"first_joinable_source_values:\n{joinable_preview}\n"
             f"JOIN_BATCH_LIMIT: {settings.join_batch_limit}\n"
             f"JOIN_DELAY_SECONDS: {settings.join_delay_seconds}",
             parse_mode="HTML",
@@ -1203,7 +1250,7 @@ def register_bot_handlers(
             await callback.answer("Нет доступа.", show_alert=True)
             return
         if callback.message:
-            await prepare_join_all(callback.message)
+            await prepare_join_all(callback.message, callback.from_user.id)
         await callback.answer()
 
     @router.callback_query(lambda callback: callback.data == "sources:join_selective")
@@ -1212,7 +1259,7 @@ def register_bot_handlers(
             await callback.answer("Нет доступа.", show_alert=True)
             return
         if callback.message:
-            await prepare_selective_join(callback.message)
+            await prepare_selective_join(callback.message, callback.from_user.id)
         await callback.answer()
 
     @router.callback_query(lambda callback: callback.data in {"sources:cancel", SOURCE_JOIN_CANCEL})
@@ -1230,13 +1277,38 @@ def register_bot_handlers(
         if not is_admin_callback(callback, settings):
             await callback.answer("Нет доступа.", show_alert=True)
             return
-        current = pending.pop(callback.from_user.id, {})
-        sources = current.get("sources", [])
-        if not sources or not callback.message:
-            await callback.answer("Нет списка источников для подписки.", show_alert=True)
+        if not callback.message:
+            await callback.answer("Не найден чат для запуска подписки.", show_alert=True)
             return
+
+        mode = "all" if callback.data == SOURCE_JOIN_START_ALL else "selective"
+        current = pending.get(callback.from_user.id, {})
+        sources = list(current.get("source_values") or [])
+
+        if mode == "all" and not sources:
+            candidates, joinable, sources = _load_joinable_source_values_from_candidates_file(settings.source_candidates_file)
+            logger.info(
+                "source join start_all restored candidates=%s joinable=%s source_values=%s",
+                len(candidates),
+                len(joinable),
+                len(sources),
+            )
+        elif mode == "selective":
+            logger.info("source join start_selective pending_source_values=%s", len(sources))
+
+        if not sources:
+            if mode == "selective":
+                await callback.answer(
+                    "Список источников не найден. Нажмите «Выборочно» и отправьте список заново.",
+                    show_alert=True,
+                )
+            else:
+                await callback.answer("Нет списка источников для подписки.", show_alert=True)
+            return
+
+        pending.pop(callback.from_user.id, None)
         await callback.answer()
-        await confirm_join(callback.message, list(sources))
+        await _start_join_task(callback.message, sources, mode=mode)
 
     @router.callback_query(lambda callback: callback.data == "rules:menu")
     async def rules_menu_callback(callback: CallbackQuery) -> None:
@@ -1402,23 +1474,27 @@ def register_bot_handlers(
             await run_source_search(message, queries)
             return
 
-        if action == "selective_sources":
-            sources = parse_sources_text(value)
+        if action == "source_join_selective_wait_list":
+            line_count = len([line for line in (message.text or "").splitlines() if line.strip()])
+            sources = _normalize_source_values_for_join(parse_sources_text(value))
+            logger.info("source selective text received lines=%s parsed=%s", line_count, len(sources))
             if not sources:
+                pending[user_id] = current
                 await message.answer("Не получил ни одного публичного @username или t.me-ссылки. Пришлите список каналов ещё раз.")
                 return
             warning = ""
             if len(sources) > 100:
                 sources = sources[:100]
                 warning = "\nСписок был больше 100 источников, взял первые 100."
-            pending[user_id] = {"action": "confirm_join_selective", "category": "", "sources": sources}
-            await message.answer(
-                f"Принял {len(sources)} источников.{warning}\n"
-                "Подписаться безопасной партией?\n"
-                f"Максимум за запуск: {settings.join_batch_limit}\n"
-                f"Задержка между подписками: {settings.join_delay_seconds} секунд",
-                reply_markup=_confirm_join_markup("selective"),
-            )
+            pending[user_id] = {
+                "action": "source_join_confirm",
+                "source_values": sources,
+                "mode": "selective",
+            }
+            text, markup = _prepare_join_confirmation(sources, settings, "selective")
+            if warning:
+                text = text.replace("\nПодписаться безопасной партией?", f"{warning}\nПодписаться безопасной партией?", 1)
+            await message.answer(text, reply_markup=markup)
             return
 
         if action in {"add", "remove"}:
