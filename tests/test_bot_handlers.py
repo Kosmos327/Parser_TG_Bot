@@ -1,9 +1,20 @@
 from app.bot_handlers import (
+    PENDING_LEAD_COMMENT,
+    PENDING_LEAD_DATE,
+    PENDING_LEAD_SEARCH,
+    PENDING_RULE_ADD,
+    PENDING_RULE_MIN_LENGTH,
+    PENDING_RULE_REMOVE,
+    PENDING_SOURCE_JOIN_CONFIRM,
+    PENDING_SOURCE_JOIN_SELECTIVE_WAIT_LIST,
+    PENDING_SOURCE_SEARCH_WAIT_QUERIES,
     SOURCE_JOIN_CANCEL,
     SOURCE_JOIN_START_ALL,
     SOURCE_JOIN_START_SELECTIVE,
     _candidate_source_values_for_join,
+    _format_pending_debug,
     _normalize_source_values_for_join,
+    _parse_source_queries,
 )
 
 
@@ -38,3 +49,44 @@ def test_candidate_source_values_from_joinable_fixture_returns_eight() -> None:
     ]
 
     assert _candidate_source_values_for_join(candidates) == [f"@joinable_{index}" for index in range(8)]
+
+
+def test_parse_source_queries_single_word() -> None:
+    assert _parse_source_queries("бухгалтерия") == ["бухгалтерия"]
+
+
+def test_parse_source_queries_limits_multiple_lines_to_ten() -> None:
+    text = "\n".join(f"запрос {index}" for index in range(12))
+
+    assert _parse_source_queries(text) == [f"запрос {index}" for index in range(10)]
+
+
+def test_pending_action_constants_are_not_empty() -> None:
+    constants = [
+        PENDING_SOURCE_SEARCH_WAIT_QUERIES,
+        PENDING_SOURCE_JOIN_CONFIRM,
+        PENDING_SOURCE_JOIN_SELECTIVE_WAIT_LIST,
+        PENDING_LEAD_COMMENT,
+        PENDING_LEAD_DATE,
+        PENDING_LEAD_SEARCH,
+        PENDING_RULE_ADD,
+        PENDING_RULE_REMOVE,
+        PENDING_RULE_MIN_LENGTH,
+    ]
+
+    assert all(constants)
+
+
+def test_format_pending_debug_includes_action_keys_counts_and_search_text() -> None:
+    text = _format_pending_debug(123, {
+        "action": PENDING_LEAD_SEARCH,
+        "source_values": ["@one", "@two"],
+        "query": "бухгалтерия",
+        "timestamp": "2026-05-14T00:00:00+00:00",
+    })
+
+    assert "pending: yes" in text
+    assert f"action: {PENDING_LEAD_SEARCH}" in text
+    assert "source_values_count: 2" in text
+    assert "search_text: бухгалтерия" in text
+    assert "timestamp: 2026-05-14T00:00:00+00:00" in text
