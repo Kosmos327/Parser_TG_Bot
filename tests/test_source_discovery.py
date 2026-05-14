@@ -37,3 +37,13 @@ def test_filter_joinable_candidates_excludes_unsafe_statuses_and_no_username() -
     ]
 
     assert filter_joinable_candidates(candidates) == [candidates[0]]
+
+
+def test_parse_sources_text_deduplicates_case_insensitively() -> None:
+    text = """
+    channel4
+    @channel4
+    https://t.me/Channel4
+    """
+
+    assert parse_sources_text(text) == ["@channel4"]
