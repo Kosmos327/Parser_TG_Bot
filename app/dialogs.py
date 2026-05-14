@@ -42,6 +42,27 @@ def source_chats_value(username: str | None, entity_id: int | None) -> str:
     return str(entity_id)
 
 
+def is_private_user_entity(entity: Any) -> bool:
+    """Return True for Telethon User/private-dialog-like entities."""
+    if entity is None:
+        return False
+    if type(entity).__name__ == "User":
+        return True
+    return bool(getattr(entity, "first_name", None) and not getattr(entity, "title", None))
+
+
+def is_source_dialog_allowed(dialog_or_entity: Any, exclude_private_chats: bool = True) -> bool:
+    """Return whether a dialog/entity is allowed as a parser source."""
+    if not exclude_private_chats:
+        return True
+
+    if getattr(dialog_or_entity, "is_user", False):
+        return False
+
+    entity = getattr(dialog_or_entity, "entity", dialog_or_entity)
+    return not is_private_user_entity(entity)
+
+
 def dialog_info_from_entity(entity: Any, peer_id: int | None = None) -> DialogInfo:
     """Build safe, serializable dialog information from a Telethon entity."""
     title = (

@@ -14,6 +14,9 @@ class ParserState:
     matched_count: int = 0
     last_error: str | None = None
     rules: ParserRules = field(default_factory=ParserRules)
+    source_join_in_progress: bool = False
+    source_join_started_at: datetime | None = None
+    source_join_last_report: str | None = None
 
     def enable(self) -> None:
         self.enabled = True
@@ -30,5 +33,7 @@ class ParserState:
             f"Запущен: {started_at}\n"
             f"Обработано сообщений: {self.processed_count}\n"
             f"Найдено заявок: {self.matched_count}\n"
+            f"Подписка на источники: {'идёт' if self.source_join_in_progress else 'нет'}\n"
+            f"Последний отчёт подписки: {self.source_join_last_report or 'нет'}\n"
             f"Последняя ошибка: {last_error}"
         )

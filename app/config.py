@@ -29,8 +29,23 @@ class Settings(BaseModel):
     exclude_source_titles: list[str]
     max_text_length: int
     log_level: str
+    source_search_limit: int
+    join_batch_limit: int
+    join_delay_seconds: int
+    exclude_private_chats: bool
+    source_candidates_file: str
+    source_export_file: str
 
-    @field_validator("api_hash", "session_name", "bot_token", "dedup_file", "leads_file", "rules_file")
+    @field_validator(
+        "api_hash",
+        "session_name",
+        "bot_token",
+        "dedup_file",
+        "leads_file",
+        "rules_file",
+        "source_candidates_file",
+        "source_export_file",
+    )
     @classmethod
     def _not_empty(cls, value: str, info: Any) -> str:
         value = value.strip()
@@ -63,6 +78,13 @@ class Settings(BaseModel):
     def _max_text_length_valid(cls, value: int) -> int:
         if value < 1:
             raise ValueError("max_text_length must be greater than 0")
+        return value
+
+    @field_validator("source_search_limit", "join_batch_limit", "join_delay_seconds")
+    @classmethod
+    def _positive_int_valid(cls, value: int, info: Any) -> int:
+        if value < 1:
+            raise ValueError(f"{info.field_name} must be greater than 0")
         return value
 
     @field_validator("log_level")
@@ -124,6 +146,16 @@ def _require_env(name: str) -> str:
     return value
 
 
+def risky_settings_warnings(settings: Settings) -> list[str]:
+    """Return non-fatal safety warnings for source join settings."""
+    warnings: list[str] = []
+    if settings.join_batch_limit > 20:
+        warnings.append("JOIN_BATCH_LIMIT больше 20: массовая подписка рискованна и может привести к ограничениям Telegram.")
+    if settings.join_delay_seconds < 60:
+        warnings.append("JOIN_DELAY_SECONDS меньше 60: слишком частые подписки рискованны и могут вызвать FloodWait.")
+    return warnings
+
+
 def load_settings() -> Settings:
     """Load application settings from .env and validate them."""
     load_dotenv()
@@ -150,6 +182,12 @@ def load_settings() -> Settings:
         "exclude_source_titles": _parse_csv(os.getenv("EXCLUDE_SOURCE_TITLES")),
         "max_text_length": _parse_int(os.getenv("MAX_TEXT_LENGTH"), 3500, "MAX_TEXT_LENGTH"),
         "log_level": _optional_env("LOG_LEVEL", "INFO"),
+        "source_search_limit": _parse_int(os.getenv("SOURCE_SEARCH_LIMIT"), 100, "SOURCE_SEARCH_LIMIT"),
+        "join_batch_limit": _parse_int(os.getenv("JOIN_BATCH_LIMIT"), 10, "JOIN_BATCH_LIMIT"),
+        "join_delay_seconds": _parse_int(os.getenv("JOIN_DELAY_SECONDS"), 90, "JOIN_DELAY_SECONDS"),
+        "exclude_private_chats": _parse_bool(os.getenv("EXCLUDE_PRIVATE_CHATS"), True),
+        "source_candidates_file": _optional_env("SOURCE_CANDIDATES_FILE", "data/source_candidates.json"),
+        "source_export_file": _optional_env("SOURCE_EXPORT_FILE", "data/source_candidates.txt"),
     }
 
     try:
